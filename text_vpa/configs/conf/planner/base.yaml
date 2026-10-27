@@ -1,0 +1,24 @@
+# Latent planner: f_theta / f_theta_bar (pass 1), pi_phi^h (pass 2), g_phi (pass 3). Sec. 3.1.
+vocab_size: 32768          # tokenizer of the context c and the structural view y (placeholder)
+latent_dim: 256            # d, width of s_x, s_y and Z_target
+num_slots: 256             # M, learnable slot queries Delta
+num_modes: 64              # |U|, discrete design modes (placeholder; Table 1)
+max_context_len: 1024      # upper bound on M_c
+max_structure_len: 2048    # upper bound on the token length of y (AST / clause outline)
+encoder:
+  dim: 512                 # context encoder width; a linear head maps it to d
+  num_layers: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+selector:
+  hidden_dim: 512
+  num_layers: 2
+  dropout: 0.0
+predictor:
+  num_layers: 4            # shared trunk
+  num_heads: 8
+  mlp_ratio: 4.0
+  n_ens: 5                 # ensemble heads (Eq. 8)
+  head_hidden_dim: null    # null = linear heads
+  dropout: 0.0

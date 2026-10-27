@@ -1,0 +1,16 @@
+# Primary Hydra config of text-VPA (PR-JEPA). The schema and every constraint live in
+# text_vpa/configs/schema.py: unknown keys, wrong types and violated constraints raise on load.
+#
+#   from text_vpa.configs import load_config
+#   cfg = load_config(["planner=tiny", "realizer=tiny", "data=tiny"])
+defaults:
+  - planner: base
+  - bridge: default
+  - realizer: fs_dfm
+  - vicreg: default
+  - training: default
+  - data: default
+  - readout: default
+  - energy: default
+  - sampler: default
+  - _self_

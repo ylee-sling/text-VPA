@@ -1,0 +1,18 @@
+# Primary realizer: conditional FS-DFM with the exact few-step jump kernel (Sec. 3.3, Eq. 15).
+kind: fs_dfm
+vocab_size: 32768          # S (placeholder; 152064 for the Qwen2.5 tokenizer)
+hidden_dim: 2048           # d_r = d_k of the bridge
+num_layers: 24             # L_r
+num_heads: 16
+mlp_ratio: 4.0
+dropout: 0.0
+max_output_len: 1024       # N
+step_budgets: [2, 4, 8]    # trained step budgets K (step-size conditioning h = 1/K)
+num_steps: 8               # K at inference; a generation costs K + 3 sequential evaluations
+schedule: linear           # kappa_t = t: pi_{t_k,1/K} = 1/(K - k), the last step redraws every position
+source: uniform            # p0: uniform (released FS-DFM checkpoints) or mask
+temperature: 1.0           # T of the energy tilt (Eq. 17)
+c_max: 1.0                 # safety clip in (0, 1] (Prop. 4(a))
+guidance_scale: 0.0        # predictor-free guidance omega
+logit_smoothing: 0.05      # unused by fs_dfm
+logit_source_std: 1.0      # unused by fs_dfm

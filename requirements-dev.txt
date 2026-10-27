@@ -1,0 +1,6 @@
+# Runtime dependencies plus the test runner and linter used in CLAUDE.md:
+#   python -m pytest            (fast suite; add -m slow for the convergence test)
+#   ruff check .
+-r requirements.txt
+pytest==9.1.1
+ruff==0.17.3

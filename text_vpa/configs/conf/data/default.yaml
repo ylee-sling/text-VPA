@@ -1,0 +1,12 @@
+# Data pipeline (Sec. 5.1, Table 1).
+language: python           # python | cpp (HLS-C)
+tokenizer: bpe             # byte | bpe (trained offline on the corpus) | hf (tokenizer_name, e.g. Qwen/Qwen2.5-Coder-1.5B)
+tokenizer_name: null
+bpe_vocab_size: 4096
+mode_scheme: control_library   # 30 modes: control flow x library bucket (planner.num_modes >= 30)
+max_context_tokens: 512
+max_output_tokens: 512
+max_structure_tokens: 1024
+bucket_size: 32            # canvas lengths are rounded up to a multiple of this
+time_sampling: grid        # t = k/K on the step-budget grid (Algorithm 1's evaluation points)
+num_workers: 0

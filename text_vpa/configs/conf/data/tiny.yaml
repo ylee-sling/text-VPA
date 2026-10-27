@@ -1,0 +1,12 @@
+# Small limits for unit tests and CPU smoke runs (pairs with planner=tiny, realizer=tiny).
+language: python
+tokenizer: byte
+tokenizer_name: null
+bpe_vocab_size: 4096
+mode_scheme: control       # 6 modes (= planner=tiny num_modes)
+max_context_tokens: 64
+max_output_tokens: 64
+max_structure_tokens: 64
+bucket_size: 16
+time_sampling: grid
+num_workers: 0

@@ -1,0 +1,13 @@
+# L_plan (Eq. 5) with VICReg's published 25 : 25 : 1 ratio, the paper's constants, and the EMA of Eq. 4.
+lambda_invar: 25.0         # prediction (invariance) term, VICReg's weight (see VICRegConfig)
+lambda_v: 25.0             # variance hinge v(Z), Eq. 6
+lambda_c: 1.0              # covariance penalty c(Z), Eq. 7
+lambda_u: 1.0              # mode cross-entropy; no value in the paper (placeholder)
+gamma: 1.0                 # target standard deviation; also the bridge scale 1/gamma
+eps: 1.0e-4                # must stay well below gamma^2 (Prop. 3)
+head_reduction: mean       # invariance term averaged over the n_ens heads
+invariance_normalization: per_dim  # VICReg's per-element MSE (frobenius = Eq. 5 verbatim, sum over d)
+srank_abort_fraction: 0.5  # Stage 1 stops when srank(C) < 0.5 d (Sec. 5.1)
+ema_momentum_start: 0.996  # m0 (Eq. 4)
+ema_momentum_end: 1.0
+ema_schedule: linear       # Eq. 4; "cosine" gives the BYOL schedule with the same endpoints

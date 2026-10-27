@@ -1,0 +1,9 @@
+# Algorithm 1 options (K, T, c_max, schedule and guidance are in the realizer group).
+mode_strategy: sample      # u ~ pi_phi^h (Algorithm 1); greedy = argmax
+mode_temperature: 1.0
+restrict_source: true      # w_0 uniform over the plan-admissible tokens
+final_repair: true         # network-free repair of hard violations and of stalled (never-jumped) positions
+check_admissibility: true  # assert Prop. 4(d) at every parallel update
+audit_depth: true          # assert exactly K + 3 sequential network evaluations
+repair_aware: false
+default_length: null       # null: canvas length from the readout's length head

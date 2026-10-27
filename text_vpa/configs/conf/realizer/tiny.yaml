@@ -1,0 +1,18 @@
+# Small realizer and bridge widths for unit tests and CPU smoke runs.
+kind: fs_dfm
+vocab_size: 128
+hidden_dim: 64
+num_layers: 3
+num_heads: 4
+mlp_ratio: 2.0
+dropout: 0.0
+max_output_len: 64
+step_budgets: [2, 4, 8]
+num_steps: 4
+schedule: linear
+source: uniform
+temperature: 1.0
+c_max: 1.0
+guidance_scale: 0.0
+logit_smoothing: 0.05
+logit_source_std: 1.0

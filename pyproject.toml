@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "text-vpa"
+version = "0.1.0"
+description = "PR-JEPA: latent planning with few-step discrete realization for non-autoregressive code and text generation"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = [{ name = "Yeonseok Lee", email = "ylee@sling.ai.kr" }]
+requires-python = ">=3.10"
+keywords = ["jepa", "discrete flow matching", "non-autoregressive generation", "code generation", "vicreg"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Dependencies are declared once, in setup.py (install_requires / extras_require).
+dynamic = ["dependencies", "optional-dependencies"]
+
+[project.urls]
+Paper = "https://doi.org/10.5281/zenodo.23498811"
+Repository = "https://github.com/ylee-sling/text-VPA"
+"VPA reference" = "https://github.com/ylee-sling/Vision-Predictor-Action"
+
+[tool.setuptools.packages.find]
+include = ["text_vpa*"]
+
+[tool.setuptools.package-data]
+"text_vpa.configs" = ["conf/*.yaml", "conf/*/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra -m 'not slow'"
+markers = ["slow: long convergence tests (run with: pytest -m slow)"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "B", "PLE", "PLW", "UP", "I"]
+ignore = ["PLW2901"]

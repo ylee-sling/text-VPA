@@ -1,0 +1,24 @@
+# Small planner for unit tests and CPU smoke runs.
+vocab_size: 128
+latent_dim: 32
+num_slots: 16
+num_modes: 6                # = the 6 modes of the "control" scheme used by data=tiny
+max_context_len: 64
+max_structure_len: 64
+encoder:
+  dim: 48
+  num_layers: 2
+  num_heads: 4
+  mlp_ratio: 2.0
+  dropout: 0.0
+selector:
+  hidden_dim: 32
+  num_layers: 2
+  dropout: 0.0
+predictor:
+  num_layers: 2
+  num_heads: 4
+  mlp_ratio: 2.0
+  n_ens: 5
+  head_hidden_dim: null
+  dropout: 0.0

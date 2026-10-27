@@ -1,0 +1,10 @@
+# Plan readout (the plan's slot decoder, Sec. 3.3), trained in Stages 2-3 on the predicted plan.
+enabled: true
+hidden_dim: 256
+max_text_tokens: 48        # decoded tokens per slot text (signatures)
+length_bucket_size: 32     # the length head predicts the canvas length in buckets of this size
+inventory_threshold: 0.5   # identifier-bearing tokens with sigmoid > threshold are licensed
+kind_weight: 1.0
+text_weight: 1.0
+inventory_weight: 1.0
+length_weight: 0.1

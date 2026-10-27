@@ -1,0 +1,4 @@
+# Cross-attention bridge (Sec. 3.2). Conditioning Z~ = [Z_target; s_x; e(u)] / gamma, gamma = vicreg.gamma.
+spectral_norm: true        # on every W_K^l and W_V^l
+power_iterations: 1        # per training forward (torch.nn.utils.parametrizations.spectral_norm)
+plan_dropout: 0.1          # replace Z~ by the learned null token (predictor-free guidance)

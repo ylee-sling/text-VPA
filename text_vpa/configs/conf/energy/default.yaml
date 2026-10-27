@@ -1,0 +1,7 @@
+# Constraint energies of the tilted kernel (Sec. 3.3). .inf = hard term.
+enabled: true
+plan_source: readout       # readout (from Z_target) | reference (oracle, evaluation only) | none
+identifier_weight: .inf    # plan-mediated: only licensed identifier tokens (Prop. 4(d) applies)
+grammar_weight: .inf       # draft-dependent E_gram: bracket legality outside strings/comments
+arity_weight: 5.0          # draft-dependent: argument counts of planned signatures
+type_weight: 5.0           # draft-dependent: planned parameter / return annotations

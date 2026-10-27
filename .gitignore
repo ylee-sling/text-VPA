@@ -1,0 +1,37 @@
+# Virtual environments (recreate with requirements*.txt)
+.venv/
+venv/
+
+# Python bytecode and packaging
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Hydra run directories
+outputs/
+multirun/
+
+# Datasets, checkpoints and logs (never commit)
+/data/
+datasets/
+*.jsonl.gz
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+runs/
+wandb/
+logs/

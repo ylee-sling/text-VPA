@@ -1,0 +1,18 @@
+# Alternative realizer: Logit-KL flow matching along KL geodesics (Sec. 3.4, Eqs. 18-21).
+kind: logit_kl
+vocab_size: 32768
+hidden_dim: 2048
+num_layers: 24
+num_heads: 16
+mlp_ratio: 4.0
+dropout: 0.0
+max_output_len: 1024
+step_budgets: [2, 4, 8]
+num_steps: 8
+schedule: linear           # unused: the logit path is linear in t (Eq. 19)
+source: uniform            # unused: l0 ~ N(0, s^2 I)
+temperature: 1.0           # energies tilt the posterior, p~ ∝ p exp(-E/T)
+c_max: 1.0                 # unused by logit_kl
+guidance_scale: 0.0
+logit_smoothing: 0.05      # epsilon of the smoothed one-hot target (Eq. 18)
+logit_source_std: 1.0      # s
