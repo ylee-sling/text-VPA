@@ -1,0 +1,36 @@
+# One NVIDIA L4 (24 GB) with 64 GB of host memory (GCP g2-standard-16).
+# Micro-batches of 16 x 4 accumulation steps = the paper's B = 64 per optimizer step.
+# Step budgets are shorter than the paper's (100K / 300K); run --max-steps to change them.
+stage: planner
+batch_size: 16             # micro-batch
+planner:
+  learning_rate: 3.0e-4
+  warmup_steps: 2000
+  weight_decay: 0.05
+  max_steps: 50000         # also T_train of the EMA schedule (Eq. 4)
+  grad_accum_steps: 4
+realizer:
+  learning_rate: 3.0e-4
+  warmup_steps: 2000
+  weight_decay: 0.1
+  max_steps: 100000
+  grad_accum_steps: 4
+joint:
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+  weight_decay: 0.05
+  max_steps: 10000
+  grad_accum_steps: 4
+  planner_lr_scale: 0.1
+grad_clip_norm: 1.0
+collapse_check_every: 1000
+collapse_grace_steps: 2000
+seed: 0
+device: auto
+precision: bf16            # the L4 (Ada) supports bfloat16
+stage2_mode_source: reference
+readout_weight: 1.0
+activation_checkpointing: true
+realizer_loss_reduction: mean
+log_every: 50
+save_every: 1000

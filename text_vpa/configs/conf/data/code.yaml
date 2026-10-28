@@ -1,0 +1,12 @@
+# Function-level Python corpus from text_vpa.data.corpus (spec -> function pairs, decontaminated).
+language: python
+tokenizer: bpe             # byte-level BPE trained on the corpus at Stage 1 (stored in every checkpoint)
+tokenizer_name: null
+bpe_vocab_size: 32768
+mode_scheme: control_library   # 30 modes (planner=base has 64 >= 30)
+max_context_tokens: 512
+max_output_tokens: 512
+max_structure_tokens: 1024
+bucket_size: 32
+time_sampling: grid
+num_workers: 4             # collation workers (the dataset itself is built once, see --build-workers)

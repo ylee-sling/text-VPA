@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,7 +48,9 @@ from text_vpa.engine.runtime import (
     MetricLogger,
     autocast,
     build_optimizer,
+    grouped,
     load_checkpoint,
+    maybe_no_sync,
     rng_state,
     save_checkpoint,
     set_rng_state,
@@ -139,26 +141,40 @@ class Stage1Trainer:
         self.last_report: dict[str, float] = {}
 
     # -----------------------------------------------------------------------------------------
-    def train_step(self, batch: Batch) -> dict[str, float]:
+    def train_step(self, batch: Batch | Sequence[Batch]) -> dict[str, float]:
+        """One optimizer step over one batch or a group of micro-batches (gradient accumulation: the loss of
+        each micro-batch is scaled by 1 / #micro-batches; DDP all-reduces once, on the last one)."""
         self.planner.train()
-        batch = batch.to(self.device)
-        target = self.target_encoder(batch.structure, batch.slot_index, self.cfg.planner.num_slots,
-                                     batch.structure_mask)                          # sg(f_theta_bar(y))
-        if int(target.slot_mask.sum()) < 2:
-            raise ValueError("a Stage-1 batch needs at least two real slots (VICReg statistics)")
-        loss, terms, plan = self.objective(batch, target.s_y, target.slot_mask)
+        micro = [batch] if isinstance(batch, Batch) else list(batch)
+        if not micro:
+            raise ValueError("train_step needs at least one batch")
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        sums: dict[str, float] = {}
+        loss_sum = sigma_sum = 0.0
+        for i, mb in enumerate(micro):
+            mb = mb.to(self.device)
+            target = self.target_encoder(mb.structure, mb.slot_index, self.cfg.planner.num_slots,
+                                         mb.structure_mask)                          # sg(f_theta_bar(y))
+            if int(target.slot_mask.sum()) < 2:
+                raise ValueError("a Stage-1 batch needs at least two real slots (VICReg statistics)")
+            with maybe_no_sync(self.objective, skip_sync=i < len(micro) - 1):
+                loss, terms, plan = self.objective(mb, target.s_y, target.slot_mask)
+                (loss / len(micro)).backward()
+            self.monitor.update("context", masked_rows(plan.s_x.detach().float(), mb.context_mask))
+            self.monitor.update("plan", masked_rows(plan.z_target.detach().float(), target.slot_mask))
+            for k, v in terms.items():
+                sums[k] = sums.get(k, 0.0) + float(v)
+            loss_sum += float(loss.detach())
+            sigma_sum += float(plan.sigma_bar.detach().mean())
         grad_norm = torch.nn.utils.clip_grad_norm_(self.planner.parameters(), self.cfg.training.grad_clip_norm)
         self.optimizer.step()
         self.scheduler.step()
         momentum = self.ema.update()                                                # Eq. 4
-        self.monitor.update("context", masked_rows(plan.s_x.detach().float(), batch.context_mask))
-        self.monitor.update("plan", masked_rows(plan.z_target.detach().float(), target.slot_mask))
         self.step += 1
-        out = {k: float(v) for k, v in terms.items()}
-        out.update(loss=float(loss.detach()), grad_norm=float(grad_norm), ema_momentum=momentum,
-                   lr=self.optimizer.param_groups[0]["lr"], sigma_bar=float(plan.sigma_bar.detach().mean()))
+        n = len(micro)
+        out = {k: v / n for k, v in sums.items()}
+        out.update(loss=loss_sum / n, grad_norm=float(grad_norm), ema_momentum=momentum,
+                   lr=self.optimizer.param_groups[0]["lr"], sigma_bar=sigma_sum / n)
         return out
 
     def check_collapse(self) -> tuple[bool, str | None]:
@@ -195,10 +211,11 @@ class Stage1Trainer:
         start = time.time()
         while self.step < limit:
             consumed = 0
-            for batch in epoch_batches(self.loader, self.epoch, self.batch_in_epoch):
-                consumed += 1
-                metrics = self.train_step(batch)
-                self.batch_in_epoch += 1
+            batches = epoch_batches(self.loader, self.epoch, self.batch_in_epoch)
+            for group in grouped(batches, self.cfg.training.planner.grad_accum_steps):
+                consumed += len(group)
+                metrics = self.train_step(group)
+                self.batch_in_epoch += len(group)
                 if self.step % tcfg.log_every == 0 or self.step == 1:
                     metrics["steps_per_s"] = self.step / max(time.time() - start, 1e-9)
                     self.logger.log(self.step, metrics, prefix="stage1/")

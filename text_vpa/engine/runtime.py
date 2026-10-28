@@ -19,6 +19,7 @@ import os
 import random
 import sys
 import time
+from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from text_vpa.utils.device import resolve_device
 
@@ -36,6 +38,9 @@ __all__ = [
     "MetricLogger",
     "autocast",
     "build_optimizer",
+    "grouped",
+    "maybe_no_sync",
+    "set_activation_checkpointing",
     "load_checkpoint",
     "rng_state",
     "save_checkpoint",
@@ -112,6 +117,37 @@ def autocast(device: torch.device, precision: str) -> AbstractContextManager:
     if precision != "bf16":
         return nullcontext()
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
+def grouped(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
+    """Consecutive groups of ``size`` items (the last group may be shorter): micro-batches of one optimizer step."""
+    if size < 1:
+        raise ValueError("size must be >= 1")
+    group: list[Any] = []
+    for item in items:
+        group.append(item)
+        if len(group) == size:
+            yield group
+            group = []
+    if group:
+        yield group
+
+
+def maybe_no_sync(module: nn.Module, skip_sync: bool) -> AbstractContextManager:
+    """DDP's ``no_sync`` for the micro-batches before the last one of a step (gradients all-reduce once)."""
+    if skip_sync and isinstance(module, DistributedDataParallel):
+        return module.no_sync()
+    return nullcontext()
+
+
+def set_activation_checkpointing(module: nn.Module, enabled: bool) -> int:
+    """Switch activation checkpointing on every submodule that supports it; returns how many were set."""
+    count = 0
+    for sub in module.modules():
+        if hasattr(sub, "activation_checkpointing"):
+            sub.activation_checkpointing = bool(enabled)
+            count += 1
+    return count
 
 
 def set_seed(seed: int) -> None:

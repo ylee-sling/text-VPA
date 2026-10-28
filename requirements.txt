@@ -1,4 +1,4 @@
-# Exact versions text-VPA was verified with (Linux, CPU, Python 3.13, October 2026).
+# Exact versions text-VPA was verified with (Linux, Python 3.13, October 2026); numpy 2.5 needs Python >= 3.12.
 # setup.py states the minimum supported versions (torch >= 2.2). For CUDA, ROCm or Apple MPS, install the
 # matching torch build first (https://pytorch.org/get-started/locally/), then this file.
 torch==2.14.1
@@ -13,3 +13,4 @@ tokenizers==0.23.3
 tree-sitter==0.26.0
 tree-sitter-python==0.25.0
 tree-sitter-cpp==0.23.4
+pyarrow==26.0.0

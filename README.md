@@ -22,8 +22,11 @@ actions to discrete tokens.
 > [!IMPORTANT]
 > **A research prototype with equation-level verification. No trained checkpoints and no benchmark results
 > yet.** The paper's evaluation protocol (Sec. 5) has not been run. What is verified:
-> - 1,053 unit and integration tests check every equation against independent float64 references, the
+> - 1,114 unit and integration tests check every equation against independent float64 references, the
 >   K + 3 depth, Proposition 4(d), and the Stage-2 anti-leakage invariant;
+> - the Pass@k harness passes every HumanEval reference solution (164/164) and 499/500 of MBPP's test split;
+> - `scripts/gcp/train_l4.sh` (corpus → Stage 1 → Stage 2 → Pass@k) runs end to end and resumes after an
+>   interruption (checked on CPU with tiny settings; not yet run on an L4);
 > - the numerical checks of Sec. 4.6 reproduce Table 2 exactly (`python -m text_vpa.utils.verification`);
 > - the roofline model reproduces every cell of Table 3 (`python -m text_vpa.utils.profiler --roofline`);
 > - the full pipeline (Stage 1 → Stage 2 → Algorithm 1) runs end to end on CPU and with two-process DDP, and
@@ -63,8 +66,9 @@ and that every parallel update keeps plan-admissible positions admissible (Prop.
 
 ## Installation
 
-Python ≥ 3.10. Install PyTorch for your backend first ([pytorch.org](https://pytorch.org/get-started/locally/)):
-CUDA, ROCm, Apple MPS and CPU are supported. Then:
+Python ≥ 3.10 (the exact pins of `requirements*.txt` need Python ≥ 3.12, because numpy 2.5 does). Install
+PyTorch for your backend first ([pytorch.org](https://pytorch.org/get-started/locally/)): CUDA, ROCm, Apple MPS
+and CPU are supported. Then:
 
 ```bash
 git clone https://github.com/ylee-sling/text-VPA.git && cd text-VPA
@@ -107,13 +111,37 @@ Records pair a context c (specification, docstring, signature) with a target pro
 | `synthetic:N` | built-in generator of specification → program pairs over 8 templates (tests, smoke runs) |
 | `humaneval:PATH` | `HumanEval.jsonl(.gz)`: context = prompt, target = prompt + canonical solution |
 | `mbpp:PATH` | MBPP JSONL: context = text + first test, target = code |
-| `jsonl:PATH` | one `{"context": ..., "target": ..., "language": "python" \| "cpp"}` object per line |
+| `jsonl:PATH` | one `{"context": ..., "target": ..., "language": "python" \| "cpp"}` object per line; PATH may be a quoted glob (`'jsonl:data/corpus/train-*.jsonl.gz'`) |
 
 Several specs can be combined: `--data humaneval:data/HumanEval.jsonl.gz jsonl:data/corpus.jsonl`.
-- **Deduplication:** deduplicate every training corpus against the evaluation sets (Sec. 5.1).
+- **Decontamination:** every training corpus must be deduplicated against the evaluation sets (Sec. 5.1);
+  the corpus builder below does it.
 - **Tokenizers:** `data.tokenizer=bpe` trains a byte-level BPE on the training corpus offline.
   `data.tokenizer=hf data.tokenizer_name=Qwen/Qwen2.5-Coder-1.5B` uses a pretrained one.
   `data.tokenizer=byte` uses raw bytes.
+
+### Building a training corpus
+
+`python -m text_vpa.data.corpus` turns permissively licensed Python into specification → function pairs:
+
+```bash
+python -m text_vpa.data.corpus download --dataset codeparrot/github-code-clean --config Python-all \
+    --out data/raw --max-files 10                     # the Hub's Parquet conversion; resumable
+python -m text_vpa.data.corpus build --source 'parquet:data/raw/*.parquet' \
+    --humaneval data/eval/HumanEval.jsonl.gz --mbpp data/eval/mbpp.jsonl --out data/corpus
+```
+
+- **Sources:** `parquet:GLOB`, `jsonl:GLOB` (a `content`/`code` field and an optional license field) or
+  `dir:PATH` (`*.py`, with `--assume-license`).
+- **License:** only files whose license is permissive (MIT, Apache-2.0, BSD, ISC, ...) are used.
+- **Pairs:** every top-level function with a docstring, a real body and no reference to anything except its
+  parameters, locals, builtins and module-level imports. Context = the imports it uses + signature +
+  docstring (HumanEval's prompt format); target = the imports + the whole function.
+- **Deduplication:** exact, on the function's AST without its docstring.
+- **Decontamination:** a function sharing any 13-word n-gram (identifiers and numbers; formatting ignored) with
+  a HumanEval or MBPP problem is dropped.
+- **Output:** `train-*.jsonl.gz` shards, `val.jsonl.gz` (0.5%, by hash) and `stats.json` with the count each
+  filter removed. On the Python standard library it keeps about 8,000 functions from 18,000 files.
 
 ## Training (Sec. 5.1)
 
@@ -138,7 +166,16 @@ Several specs can be combined: `--data humaneval:data/HumanEval.jsonl.gz jsonl:d
 - **Mixed precision and logging.** bf16 with `training.precision=bf16`. Weights & Biases with
   `--wandb-project NAME`; metrics are also written to `<output-dir>/metrics.jsonl`.
 - **Checkpoints and resumption.** Checkpoints are self-contained (config, tokenizer, weights) and atomic.
-  `--resume` continues the exact data stream (with `data.num_workers=0`).
+  `--resume` continues the exact data stream (with `data.num_workers=0`); Stage 1 reuses the checkpoint's
+  tokenizer.
+- **One memory-limited GPU.** `training.<stage>.grad_accum_steps=k` makes one optimizer step from k
+  micro-batches of `training.batch_size`; `training.activation_checkpointing=true` recomputes realizer blocks
+  in the backward pass. Both leave the gradients unchanged (tested).
+- **Large corpora.** `--build-workers N` tokenizes and parses in N processes. `--dataset-cache DIR` stores the
+  built examples (int32 arrays, a few KB each), so Stage 2 and resumed runs load them instead of rebuilding.
+- **Memory check.** `python -m text_vpa.utils.memory_probe planner=base realizer=l4 data=code training=l4` runs
+  optimizer steps on worst-case batches and reports the peak GPU memory, the time per step and the projected
+  wall time.
 
 Configuration is a typed Pydantic schema composed by Hydra (`text_vpa/configs/conf`). Pass overrides as
 trailing arguments, e.g. `planner=tiny realizer=logit_kl realizer.num_steps=4 training.batch_size=32`.
@@ -149,6 +186,56 @@ Defaults follow the paper:
 - VICReg weights 25 : 25 : 1, γ = 1, ε = 10⁻⁴, m₀ = 0.996 → 1;
 - d_r = 2048, L_r = 24, K ∈ {2, 4, 8};
 - c_max = 1, T = 1, B = 64.
+
+## Training on a GCP L4 VM
+
+The `l4` presets fit one NVIDIA L4 (24 GB) with 64 GB of host memory (GCP `g2-standard-16`):
+- the planner of the paper (42M parameters);
+- a 325M-parameter realizer (d_r = 1024, 16 layers, N ≤ 512);
+- a 32K BPE vocabulary;
+- bf16, activation checkpointing, and micro-batches of 16 × 4 accumulation steps (B = 64).
+
+```bash
+# on your machine: create the VM (Deep Learning VM image, Ubuntu 24.04, NVIDIA driver 580)
+ZONE=asia-northeast3-b scripts/gcp/create_vm.sh            # PROVISIONING=SPOT for a preemptible VM
+gcloud compute ssh text-vpa-l4 --zone asia-northeast3-b
+
+# on the VM
+git clone https://github.com/ylee-sling/text-VPA.git && cd text-VPA
+bash scripts/gcp/setup_vm.sh       # venv, pinned deps, GPU check, HumanEval/MBPP, harness check, tests
+tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'
+```
+
+`train_l4.sh` runs these steps in order:
+1. download and build the corpus;
+2. check memory on worst-case batches;
+3. Stage 1 (50K steps);
+4. Stage 2 (100K steps, validation loss every 2,000 steps);
+5. Pass@k on HumanEval and MBPP.
+
+Re-running the same command after a stop skips finished steps and resumes the interrupted stage from its last
+checkpoint (every 1,000 steps). Use this after a Spot preemption. Set `GCS=gs://BUCKET/PATH` to copy `runs/` to
+Cloud Storage every 30 minutes. Every setting is a variable at the top of the script.
+- **GPU quota:** new projects usually need an L4 GPU quota increase in the region first.
+- **Zone:** list zones with L4 GPUs with `gcloud compute accelerator-types list --filter=name=nvidia-l4`.
+
+## Evaluation (Pass@k)
+
+```bash
+python evaluate.py --benchmark humaneval --data data/eval/HumanEval.jsonl.gz \
+    --checkpoint runs/l4/stage2/best_stage2.pt --num-samples 10 --k 1 10 --out runs/eval/humaneval
+python evaluate.py --benchmark mbpp --data data/eval/mbpp.jsonl --reference --out runs/eval/mbpp-reference
+```
+
+- **Sampling:** every problem gets n samples from Algorithm 1, with the context the training loaders build.
+- **Programs run:**
+  - HumanEval: prompt + sample + tests + `check(entry_point)`;
+  - MBPP: setup + sample + asserts (test split 11–510 by default).
+- **Execution:** each program runs in its own resource-limited process (CPU, memory, file size, timeout). This
+  isolates crashes and hangs but is not a security sandbox, so run it on a disposable VM.
+- **Score:** pass@k is the unbiased estimator of Chen et al. (2021).
+- **Harness check:** `--reference` runs the canonical solutions. HumanEval passes 164/164 and MBPP 499/500;
+  MBPP task 367's tests use an undefined class.
 
 ## Inference and profiling
 
@@ -205,6 +292,13 @@ These are recorded in [`CLAUDE.md`](CLAUDE.md). The most consequential:
   that no training example had is out of distribution.
 - **Stable-rank guard grace period.** The guard does not abort during a grace period, because random
   initializations are low-rank. The paper checks after each epoch.
+- **Gradient accumulation.** Each micro-batch loss is scaled by 1/k. Two effects differ from one batch of k
+  times the size:
+  - VICReg's batch statistics are computed per micro-batch;
+  - the spectral-norm power iteration on W_K, W_V advances once per micro-batch.
+- **Decontamination.** A training function is dropped if it shares any 13-word n-gram with an evaluation
+  problem, where words are identifiers and numbers (GPT-3's 13-gram rule). Punctuation is not counted, because
+  a shared signature alone such as `(numbers: List[int]) -> List[int]` is not contamination.
 
 ## Repository layout
 
@@ -214,13 +308,14 @@ text-VPA/
 │   ├── configs/            Pydantic schema + Hydra YAML groups (planner, bridge, realizer, vicreg, training, data, readout, energy, sampler)
 │   ├── models/             encoders, ema, selector, predictor, bridge, readout, plan, text_vpa_model, layers
 │   │   └── realizers/      backbone (AdaLN), fs_dfm, logit_kl, kernels, paths
-│   ├── data/               tokenization, ast_parser (tree-sitter), dataset, synthetic
+│   ├── data/               tokenization, ast_parser (tree-sitter), dataset, corpus (builder), synthetic
 │   ├── engine/             losses, trainer_stage1, trainer_stage2, runtime
 │   ├── inference/          sampler (Algorithm 1), energy_terms, loading
-│   └── utils/              verification (App. B), profiler (Sec. 5.4), device
+│   ├── evaluation/         pass@k, sandboxed execution, HumanEval / MBPP tasks
+│   └── utils/              verification (App. B), profiler (Sec. 5.4), memory_probe, device
 ├── tests/                  equation-level tests, theory verification, end-to-end
-├── train.py  generate.py   CLIs
-├── scripts/                init_repo.sh, release.sh
+├── train.py  generate.py  evaluate.py   CLIs
+├── scripts/                init_repo.sh, release.sh; gcp/ (create_vm, setup_vm, train_l4)
 └── docs/pr_jepa_preprint.pdf
 ```
 

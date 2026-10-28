@@ -29,6 +29,7 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from text_vpa.models.bridge import BridgeKVCache, CrossAttentionBridge
 from text_vpa.models.layers import FeedForward, MultiHeadAttention
@@ -107,6 +108,8 @@ class RealizerBackbone(nn.Module):
         self.blocks = nn.ModuleList(RealizerBlock(hidden_dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers))
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
         self.head = nn.Linear(hidden_dim, vocab_size)
+        # Recompute each block in the backward pass instead of storing its activations (training only).
+        self.activation_checkpointing = False
         nn.init.normal_(self.position.weight, std=0.02)
         for proj in (self.block_modulation[-1], self.final_modulation[-1]):
             nn.init.zeros_(proj.weight)
@@ -132,7 +135,11 @@ class RealizerBackbone(nn.Module):
              + self.h_embed(timestep_embedding(h, self.time_dim).to(dtype)))
         modulation = self.block_modulation(c).view(b, 9, d)
         x = x + self.position(torch.arange(n, device=x.device))
+        recompute = self.activation_checkpointing and self.training and torch.is_grad_enabled()
         for layer, block in enumerate(self.blocks):
-            x = block(x, modulation, layer, bridge, cache)
+            if recompute:
+                x = checkpoint(block, x, modulation, layer, bridge, cache, use_reentrant=False)
+            else:
+                x = block(x, modulation, layer, bridge, cache)
         shift, scale = self.final_modulation(c).view(b, 2, 1, d).unbind(dim=1)
         return self.head(_modulate(self.final_norm(x), shift, scale))

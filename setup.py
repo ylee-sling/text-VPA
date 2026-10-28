@@ -22,6 +22,7 @@ INSTALL_REQUIRES = [
 
 EXTRAS_REQUIRE = {
     "dev": ["pytest>=8", "ruff>=0.6"],
+    "corpus": ["pyarrow>=14"],          # Parquet sources of text_vpa.data.corpus
     "wandb": ["wandb>=0.16"],
 }
 

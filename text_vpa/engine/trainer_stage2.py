@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,9 +46,12 @@ from text_vpa.engine.runtime import (
     MetricLogger,
     autocast,
     build_optimizer,
+    grouped,
     load_checkpoint,
+    maybe_no_sync,
     rng_state,
     save_checkpoint,
+    set_activation_checkpointing,
     set_rng_state,
     warmup_cosine,
 )
@@ -167,6 +170,7 @@ class Stage2Trainer:
         planner = self.model.planner
         planner.requires_grad_(False)
         planner.eval()
+        set_activation_checkpointing(self.model.realizer, self.cfg.training.activation_checkpointing)
         self.optimizer = build_optimizer(self._trainable_parts(), self.stage_cfg.weight_decay)
         self.scheduler = warmup_cosine(self.optimizer, self.stage_cfg.warmup_steps, self.stage_cfg.max_steps)
         self.objective: nn.Module = RealizerObjective(self.model, self.cfg, self.tokenizer.pad_id)
@@ -203,16 +207,28 @@ class Stage2Trainer:
             plan = self.model.planner.plan(batch.context, batch.context_mask, mode=mode, strategy="sample")
         return plan.detach()
 
-    def train_step(self, batch: Batch) -> dict[str, float]:
+    def train_step(self, batch: Batch | Sequence[Batch]) -> dict[str, float]:
+        """One optimizer step over one batch or a group of micro-batches (loss scaled by 1 / #micro-batches;
+        DDP all-reduces once, on the last micro-batch)."""
         self.model.realizer.train()
         if self.model.readout is not None:
             self.model.readout.train()
         self.model.planner.eval()
-        batch = batch.to(self.device)
-        plan = self.plan(batch)
-        loss, terms = self.objective(batch, plan)
+        micro = [batch] if isinstance(batch, Batch) else list(batch)
+        if not micro:
+            raise ValueError("train_step needs at least one batch")
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        sums: dict[str, float] = {}
+        loss_sum = 0.0
+        for i, mb in enumerate(micro):
+            mb = mb.to(self.device)
+            plan = self.plan(mb)
+            with maybe_no_sync(self.objective, skip_sync=i < len(micro) - 1):
+                loss, terms = self.objective(mb, plan)
+                (loss / len(micro)).backward()
+            for k, v in terms.items():
+                sums[k] = sums.get(k, 0.0) + float(v)
+            loss_sum += float(loss.detach())
         params = [p for g in self.optimizer.param_groups for p in g["params"]]
         grad_norm = torch.nn.utils.clip_grad_norm_(params, self.cfg.training.grad_clip_norm)
         self.optimizer.step()
@@ -220,8 +236,9 @@ class Stage2Trainer:
         self.step += 1
         if self.step % self.fingerprint_every == 0:
             self.verify_planner_unchanged()
-        out = {k: float(v) for k, v in terms.items()}
-        out.update(loss=float(loss.detach()), grad_norm=float(grad_norm), lr=self.optimizer.param_groups[0]["lr"])
+        n = len(micro)
+        out = {k: v / n for k, v in sums.items()}
+        out.update(loss=loss_sum / n, grad_norm=float(grad_norm), lr=self.optimizer.param_groups[0]["lr"])
         return out
 
     def verify_planner_unchanged(self) -> None:
@@ -254,10 +271,11 @@ class Stage2Trainer:
         last_eval = -1
         while self.step < limit:
             consumed = 0
-            for batch in epoch_batches(self.loader, self.epoch, self.batch_in_epoch):
-                consumed += 1
-                metrics = self.train_step(batch)
-                self.batch_in_epoch += 1
+            batches = epoch_batches(self.loader, self.epoch, self.batch_in_epoch)
+            for group in grouped(batches, self.stage_cfg.grad_accum_steps):
+                consumed += len(group)
+                metrics = self.train_step(group)
+                self.batch_in_epoch += len(group)
                 if self.step % tcfg.log_every == 0 or self.step == 1:
                     metrics["steps_per_s"] = self.step / max(time.time() - start, 1e-9)
                     self.logger.log(self.step, metrics, prefix=prefix)
@@ -377,6 +395,7 @@ class Stage3Trainer(Stage2Trainer):
     def _configure(self) -> None:
         planner = self.model.planner
         planner.requires_grad_(True)
+        set_activation_checkpointing(self.model.realizer, self.cfg.training.activation_checkpointing)
         lr = self.stage_cfg.learning_rate
         parts = self._trainable_parts() + [("planner", planner, lr * self.stage_cfg.planner_lr_scale)]
         self.optimizer = build_optimizer(parts, self.stage_cfg.weight_decay)
@@ -406,22 +425,33 @@ class Stage3Trainer(Stage2Trainer):
         with torch.no_grad(), autocast(self.device, self.cfg.training.precision):
             return self.model.planner.plan(batch.context, batch.context_mask, mode=mode, strategy="sample").detach()
 
-    def train_step(self, batch: Batch) -> dict[str, float]:
+    def train_step(self, batch: Batch | Sequence[Batch]) -> dict[str, float]:
         self.model.train()
-        batch = batch.to(self.device)
-        loss, terms, plan, slot_mask = self.joint(batch)
+        micro = [batch] if isinstance(batch, Batch) else list(batch)
+        if not micro:
+            raise ValueError("train_step needs at least one batch")
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        sums: dict[str, float] = {}
+        loss_sum = 0.0
+        for i, mb in enumerate(micro):
+            mb = mb.to(self.device)
+            with maybe_no_sync(self.joint, skip_sync=i < len(micro) - 1):
+                loss, terms, plan, slot_mask = self.joint(mb)
+                (loss / len(micro)).backward()
+            self.monitor.update("context", masked_rows(plan.s_x.float(), mb.context_mask))
+            self.monitor.update("plan", masked_rows(plan.z_target.float(), slot_mask))
+            for k, v in terms.items():
+                sums[k] = sums.get(k, 0.0) + float(v)
+            loss_sum += float(loss.detach())
         params = [p for g in self.optimizer.param_groups for p in g["params"]]
         grad_norm = torch.nn.utils.clip_grad_norm_(params, self.cfg.training.grad_clip_norm)
         self.optimizer.step()
         self.scheduler.step()
         momentum = self.ema.update()
-        self.monitor.update("context", masked_rows(plan.s_x.float(), batch.context_mask))
-        self.monitor.update("plan", masked_rows(plan.z_target.float(), slot_mask))
         self.step += 1
-        out = {k: float(v) for k, v in terms.items()}
-        out.update(loss=float(loss.detach()), grad_norm=float(grad_norm), ema_momentum=momentum,
+        n = len(micro)
+        out = {k: v / n for k, v in sums.items()}
+        out.update(loss=loss_sum / n, grad_norm=float(grad_norm), ema_momentum=momentum,
                    lr=self.optimizer.param_groups[0]["lr"])
         return out
 

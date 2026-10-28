@@ -1,0 +1,20 @@
+# One NVIDIA L4 (24 GB): a 325M-parameter FS-DFM realizer (d_r = 1024, 16 layers; 258M without embeddings)
+# with N <= 512. Pairs with training=l4 (bf16, activation checkpointing, gradient accumulation) and data=code.
+# Check the fit on the VM first: python -m text_vpa.utils.memory_probe planner=base realizer=l4 data=code training=l4
+kind: fs_dfm
+vocab_size: 32768          # S (set from the trained BPE at Stage 1)
+hidden_dim: 1024           # d_r = d_k of the bridge
+num_layers: 16             # L_r
+num_heads: 16
+mlp_ratio: 4.0
+dropout: 0.0
+max_output_len: 512        # N (= data.max_output_tokens)
+step_budgets: [2, 4, 8]
+num_steps: 8
+schedule: linear
+source: uniform
+temperature: 1.0
+c_max: 1.0
+guidance_scale: 0.0
+logit_smoothing: 0.05
+logit_source_std: 1.0

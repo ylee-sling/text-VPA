@@ -24,15 +24,19 @@ Loaders read local files (no network): HumanEval and MBPP JSONL (optionally gzip
 from __future__ import annotations
 
 import gzip
+import hashlib
 import itertools
 import json
 import logging
 import math
+import multiprocessing
+import pickle
 import random
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -118,18 +122,177 @@ def load_jsonl(path: str | Path) -> list[CodeRecord]:
 # =============================================================================================
 # Examples
 # =============================================================================================
-@dataclass(frozen=True)
 class Example:
-    context: list[int]
-    target: list[int]
-    structure: list[int]
-    slot_index: list[int]
-    mode: int
-    slot_kinds: list[int]          # [M]
-    slot_texts: list[list[int]]    # [M][L_text]
-    inventory: list[int]           # identifier-bearing token ids of the target
-    num_slots: int                 # real slots (<= M)
-    task_id: str | None = None
+    """One tokenised example, stored compactly: int32 arrays, and slot texts only for the slots that carry one.
+
+    Python lists of token ids cost about 36 bytes per token; at M = 256 slots x L_text = 48 a dense slot-text
+    table alone is ~100 KB per example, i.e. tens of GB for a real corpus. Here an example of a few hundred
+    tokens takes a few KB. The list-valued properties (``context``, ``target``, ``structure``, ``slot_index``,
+    ``slot_kinds``, ``slot_texts`` [M][L_text], ``inventory``) materialise the full layout on demand; the
+    collator reads the arrays.
+    """
+
+    __slots__ = ("context_ids", "target_ids", "structure_ids", "slot_index_ids", "mode", "kinds", "text_slots",
+                 "text_ids", "text_len", "pad_id", "inventory_ids", "num_slots", "task_id")
+
+    def __init__(self, context: Sequence[int], target: Sequence[int], structure: Sequence[int],
+                 slot_index: Sequence[int], mode: int, slot_kinds: Sequence[int],
+                 text_rows: dict[int, Sequence[int]], text_len: int, pad_id: int, inventory: Sequence[int],
+                 num_slots: int, task_id: str | None = None) -> None:
+        self.context_ids = np.asarray(context, dtype=np.int32)
+        self.target_ids = np.asarray(target, dtype=np.int32)
+        self.structure_ids = np.asarray(structure, dtype=np.int32)
+        self.slot_index_ids = np.asarray(slot_index, dtype=np.int32)
+        if self.slot_index_ids.shape != self.structure_ids.shape:
+            raise ValueError("structure and slot_index must have the same length")
+        self.mode = int(mode)
+        self.kinds = np.asarray(slot_kinds, dtype=np.int8)
+        slots = sorted(text_rows)
+        self.text_slots = np.asarray(slots, dtype=np.int32)
+        self.text_ids = tuple(np.asarray(list(text_rows[m])[:text_len], dtype=np.int32) for m in slots)
+        self.text_len = int(text_len)
+        self.pad_id = int(pad_id)
+        self.inventory_ids = np.asarray(inventory, dtype=np.int32)
+        self.num_slots = int(num_slots)
+        self.task_id = task_id
+
+    def __getstate__(self) -> dict:
+        return {k: getattr(self, k) for k in self.__slots__}
+
+    def __setstate__(self, state: dict) -> None:
+        for k, v in state.items():
+            object.__setattr__(self, k, v)
+
+    @property
+    def context(self) -> list[int]:
+        return self.context_ids.tolist()
+
+    @property
+    def target(self) -> list[int]:
+        return self.target_ids.tolist()
+
+    @property
+    def structure(self) -> list[int]:
+        return self.structure_ids.tolist()
+
+    @property
+    def slot_index(self) -> list[int]:
+        return self.slot_index_ids.tolist()
+
+    @property
+    def slot_kinds(self) -> list[int]:
+        return self.kinds.tolist()
+
+    @property
+    def inventory(self) -> list[int]:
+        return self.inventory_ids.tolist()
+
+    @property
+    def slot_texts(self) -> list[list[int]]:
+        """[M][L_text]: each text slot's ids right-padded with [PAD]; every other slot all [PAD]."""
+        dense = [[self.pad_id] * self.text_len for _ in range(len(self.kinds))]
+        for m, ids in zip(self.text_slots.tolist(), self.text_ids, strict=True):
+            dense[m][: len(ids)] = ids.tolist()
+        return dense
+
+    @property
+    def nbytes(self) -> int:
+        arrays = (self.context_ids, self.target_ids, self.structure_ids, self.slot_index_ids, self.kinds,
+                  self.text_slots, self.inventory_ids, *self.text_ids)
+        return sum(a.nbytes for a in arrays)
+
+
+class _ExampleBuilder:
+    """Records -> ``Example``s (picklable: it is sent once to each worker of a parallel build)."""
+
+    def __init__(self, tokenizer: TextVPATokenizer, num_slots: int, max_context: int, max_output: int,
+                 max_structure: int, max_text: int, mode_scheme: str, skip_unparseable: bool,
+                 word_bearing: Sequence[bool]) -> None:
+        self.tokenizer = tokenizer
+        self.num_slots = num_slots
+        self.max_context = max_context
+        self.max_output = max_output
+        self.max_structure = max_structure
+        self.max_text = max_text
+        self.mode_scheme = mode_scheme
+        self.skip_unparseable = skip_unparseable
+        self.word_bearing = np.asarray(word_bearing, dtype=bool)
+        self._extractors: dict[str, TreeSitterASTExtractor] = {}
+        self._modes: ModeExtractor | None = None
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        state["_extractors"], state["_modes"] = {}, None        # tree-sitter parsers are rebuilt per process
+        return state
+
+    def build_many(self, records: Sequence[CodeRecord]) -> tuple[list[Example], dict[str, int]]:
+        skipped = {"too_long": 0, "unparseable": 0}
+        out = []
+        for record in records:
+            example = self.build(record, skipped)
+            if example is not None:
+                out.append(example)
+        return out, skipped
+
+    def build(self, record: CodeRecord, skipped: dict[str, int]) -> Example | None:
+        tok = self.tokenizer
+        if self._modes is None:
+            self._modes = ModeExtractor(self.mode_scheme)
+        if record.language not in self._extractors:
+            self._extractors[record.language] = TreeSitterASTExtractor(record.language)
+        extractor = self._extractors[record.language]
+        target = tok.encode(record.target)
+        if len(target) + 1 > self.max_output:                  # + the closing [PAD]
+            skipped["too_long"] += 1
+            return None
+        try:
+            structure = extractor.parse(record.target)
+        except ValueError:                                     # e.g. source larger than the extractor's limit
+            skipped["unparseable"] += 1
+            return None
+        if self.skip_unparseable and structure.has_errors:
+            skipped["unparseable"] += 1
+            return None
+        slots = structure.slot_records(self.num_slots)
+        y: list[int] = []
+        slot_index: list[int] = []
+        kinds: list[int] = []
+        texts: dict[int, list[int]] = {}
+        real = 0
+        for m, slot in enumerate(slots):
+            kinds.append(int(slot.kind))
+            if slot.kind == SlotKind.EMPTY:
+                continue
+            real += 1
+            ids = tok.encode(slot.text)
+            piece = [tok.slot_token_id(int(slot.kind))] + ids
+            room = self.max_structure - len(y)
+            if room > 0:
+                piece = piece[:room]
+                y.extend(piece)
+                slot_index.extend([m] * len(piece))
+            if int(slot.kind) in TEXT_KINDS:
+                texts[m] = ids[: self.max_text]
+        if not y:
+            y, slot_index = [tok.null_plan_id], [-1]
+        inventory = sorted({i for i in target if self.word_bearing[i]})
+        return Example(
+            context=tok.encode(record.context)[: self.max_context] or [tok.pad_id],
+            target=target, structure=y, slot_index=slot_index, mode=self._modes(structure),
+            slot_kinds=kinds, text_rows=texts, text_len=self.max_text, pad_id=tok.pad_id, inventory=inventory,
+            num_slots=real, task_id=record.task_id,
+        )
+
+
+_WORKER: dict[str, _ExampleBuilder] = {}         # the builder of this worker process
+
+
+def _init_worker(builder: _ExampleBuilder) -> None:
+    _WORKER["builder"] = builder
+
+
+def _build_chunk(records: Sequence[CodeRecord]) -> tuple[list[Example], dict[str, int]]:
+    return _WORKER["builder"].build_many(records)
 
 
 class PRJEPADataset(Dataset):
@@ -146,12 +309,13 @@ class PRJEPADataset(Dataset):
         skip_unparseable: drop programs the extractor flags as erroneous.
         word_bearing: optional bool table [S] marking identifier-bearing tokens (inventory targets);
             computed from the tokenizer when omitted.
+        num_proc: worker processes for the build (the examples and their order do not depend on it).
     """
 
     def __init__(self, records: Sequence[CodeRecord], tokenizer: TextVPATokenizer, num_slots: int,
                  max_context_tokens: int, max_output_tokens: int, max_structure_tokens: int,
                  max_text_tokens: int = 48, mode_scheme: str = "control_library", skip_unparseable: bool = True,
-                 word_bearing: Sequence[bool] | None = None) -> None:
+                 word_bearing: Sequence[bool] | None = None, num_proc: int = 1) -> None:
         self.tokenizer = tokenizer
         self.num_slots = num_slots
         self.max_output_tokens = max_output_tokens
@@ -160,62 +324,25 @@ class PRJEPADataset(Dataset):
             word_bearing = [any(ch.isalpha() or ch == "_" for ch in s) and not tokenizer.is_special(i)
                             for i, s in enumerate(tokenizer.token_strings)]
         self.word_bearing = list(word_bearing)
-        extractors: dict[str, TreeSitterASTExtractor] = {}
+        builder = _ExampleBuilder(tokenizer, num_slots, max_context_tokens, max_output_tokens, max_structure_tokens,
+                                  max_text_tokens, mode_scheme, skip_unparseable, self.word_bearing)
         self.examples: list[Example] = []
         self.skipped: dict[str, int] = {"too_long": 0, "unparseable": 0}
-        for record in records:
-            if record.language not in extractors:
-                extractors[record.language] = TreeSitterASTExtractor(record.language)
-            example = self._build(record, extractors[record.language], max_context_tokens, max_structure_tokens,
-                                  max_text_tokens, skip_unparseable)
-            if example is not None:
-                self.examples.append(example)
+        records = list(records)
+        if num_proc > 1 and len(records) >= 2 * num_proc:
+            size = max(1, min(2000, math.ceil(len(records) / (4 * num_proc))))
+            chunks = [records[i:i + size] for i in range(0, len(records), size)]
+            context = multiprocessing.get_context("spawn")   # fork is unsafe in a multi-threaded (torch) process
+            with context.Pool(num_proc, initializer=_init_worker, initargs=(builder,)) as pool:
+                parts = pool.imap(_build_chunk, chunks)              # ordered: same examples as num_proc = 1
+                for examples, skipped in parts:
+                    self.examples.extend(examples)
+                    for key, value in skipped.items():
+                        self.skipped[key] += value
+        else:
+            self.examples, self.skipped = builder.build_many(records)
         if any(self.skipped.values()):
             logger.info("skipped records: %s", self.skipped)
-
-    def _build(self, record: CodeRecord, extractor: TreeSitterASTExtractor, max_context: int, max_structure: int,
-               max_text: int, skip_unparseable: bool) -> Example | None:
-        tok = self.tokenizer
-        target = tok.encode(record.target)
-        if len(target) + 1 > self.max_output_tokens:          # + the closing [PAD]
-            self.skipped["too_long"] += 1
-            return None
-        try:
-            structure = extractor.parse(record.target)
-        except ValueError:                                     # e.g. source larger than the extractor's limit
-            self.skipped["unparseable"] += 1
-            return None
-        if skip_unparseable and structure.has_errors:
-            self.skipped["unparseable"] += 1
-            return None
-        slots = structure.slot_records(self.num_slots)
-        y: list[int] = []
-        slot_index: list[int] = []
-        kinds: list[int] = []
-        texts: list[list[int]] = []
-        real = 0
-        for m, slot in enumerate(slots):
-            kinds.append(int(slot.kind))
-            if slot.kind == SlotKind.EMPTY:
-                texts.append([tok.pad_id] * max_text)
-                continue
-            real += 1
-            ids = tok.encode(slot.text)
-            piece = [tok.slot_token_id(int(slot.kind))] + ids
-            room = max_structure - len(y)
-            if room > 0:
-                piece = piece[:room]
-                y.extend(piece)
-                slot_index.extend([m] * len(piece))
-            texts.append(tok.pad_to(ids, max_text) if int(slot.kind) in TEXT_KINDS else [tok.pad_id] * max_text)
-        if not y:
-            y, slot_index = [tok.null_plan_id], [-1]
-        inventory = sorted({i for i in target if self.word_bearing[i]})
-        return Example(
-            context=tok.encode(record.context)[:max_context] or [tok.pad_id],
-            target=target, structure=y, slot_index=slot_index, mode=self.modes(structure),
-            slot_kinds=kinds, slot_texts=texts, inventory=inventory, num_slots=real, task_id=record.task_id,
-        )
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -225,7 +352,57 @@ class PRJEPADataset(Dataset):
 
     def canvas_lengths(self, bucket_size: int) -> list[int]:
         """Canvas length of every example: target + one [PAD], rounded up to the bucket size."""
-        return [_round_up(len(e.target) + 1, bucket_size, self.max_output_tokens) for e in self.examples]
+        return [_round_up(len(e.target_ids) + 1, bucket_size, self.max_output_tokens) for e in self.examples]
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes held by the examples' arrays."""
+        return sum(e.nbytes for e in self.examples)
+
+    # -----------------------------------------------------------------------------------------
+    @staticmethod
+    def cache_key(records: Sequence[CodeRecord], tokenizer: TextVPATokenizer, **settings: object) -> str:
+        """SHA-256 of the records, the tokenizer spec and the build settings."""
+        digest = hashlib.sha256()
+        digest.update(json.dumps({"tokenizer": tokenizer.spec(), "settings": settings, "format": 2},
+                                 sort_keys=True, default=str).encode())
+        for r in records:
+            for field in (r.context, r.target, r.language, r.task_id or ""):
+                digest.update(field.encode("utf-8", "surrogatepass"))
+                digest.update(b"\x00")
+        return digest.hexdigest()
+
+    @classmethod
+    def cached(cls, cache_dir: str | Path | None, records: Sequence[CodeRecord], tokenizer: TextVPATokenizer,
+               num_slots: int, max_context_tokens: int, max_output_tokens: int, max_structure_tokens: int,
+               max_text_tokens: int = 48, mode_scheme: str = "control_library", num_proc: int = 1) -> PRJEPADataset:
+        """Build the dataset, or load it from ``cache_dir`` when an identical build was saved there."""
+        settings = dict(num_slots=num_slots, max_context=max_context_tokens, max_output=max_output_tokens,
+                        max_structure=max_structure_tokens, max_text=max_text_tokens, mode_scheme=mode_scheme)
+        path = None
+        if cache_dir is not None:
+            path = Path(cache_dir) / f"dataset-{cls.cache_key(records, tokenizer, **settings)[:32]}.pkl"
+            if path.exists():
+                with open(path, "rb") as handle:
+                    state = pickle.load(handle)
+                dataset = cls.__new__(cls)
+                dataset.tokenizer = tokenizer
+                dataset.modes = ModeExtractor(mode_scheme)
+                dataset.__dict__.update(state)
+                logger.info("loaded %d cached examples from %s", len(dataset), path)
+                return dataset
+        dataset = cls(records, tokenizer, num_slots, max_context_tokens, max_output_tokens, max_structure_tokens,
+                      max_text_tokens, mode_scheme, num_proc=num_proc)
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            with open(tmp, "wb") as handle:
+                pickle.dump({k: getattr(dataset, k) for k in ("num_slots", "max_output_tokens", "word_bearing",
+                                                               "examples", "skipped")},
+                            handle, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp.replace(path)
+            logger.info("cached %d examples (%.1f MB of arrays) in %s", len(dataset), dataset.nbytes / 2**20, path)
+        return dataset
 
 
 def _round_up(n: int, multiple: int, cap: int) -> int:
@@ -312,42 +489,46 @@ class PRJEPACollator:
         self.max_output_tokens = max_output_tokens
         self.corruption = corruption
 
-    def _pad(self, rows: list[list[int]], length: int, fill: int) -> Tensor:
+    @staticmethod
+    def _pad(rows: Sequence[np.ndarray], length: int, fill: int) -> Tensor:
         out = torch.full((len(rows), length), fill, dtype=torch.long)
         for i, row in enumerate(rows):
-            out[i, : len(row)] = torch.tensor(row[:length], dtype=torch.long)
+            row = row[:length]
+            out[i, : len(row)] = torch.from_numpy(row.astype(np.int64))
         return out
 
     def __call__(self, examples: Sequence[Example]) -> Batch:
         if not examples:
             raise ValueError("empty batch")
         b = len(examples)
-        m_c = max(len(e.context) for e in examples)
-        n = _round_up(max(len(e.target) for e in examples) + 1, self.bucket_size, self.max_output_tokens)
-        t_len = max(len(e.structure) for e in examples)
-        context = self._pad([e.context for e in examples], m_c, self.pad_id)
+        m_c = max(len(e.context_ids) for e in examples)
+        n = _round_up(max(len(e.target_ids) for e in examples) + 1, self.bucket_size, self.max_output_tokens)
+        t_len = max(len(e.structure_ids) for e in examples)
         context_mask = torch.zeros(b, m_c, dtype=torch.bool)
         structure_mask = torch.zeros(b, t_len, dtype=torch.bool)
         inventory = torch.zeros(b, self.vocab_size, dtype=torch.float32)
+        kinds = torch.zeros(b, self.num_slots, dtype=torch.long)
+        slot_texts = torch.full((b, self.num_slots, self.max_text_tokens), self.pad_id, dtype=torch.long)
         for i, e in enumerate(examples):
-            context_mask[i, : len(e.context)] = True
-            structure_mask[i, : len(e.structure)] = True
-            if e.inventory:
-                inventory[i, e.inventory] = 1.0
-        slot_texts = torch.tensor([e.slot_texts for e in examples], dtype=torch.long)
-        kinds = torch.tensor([e.slot_kinds for e in examples], dtype=torch.long)
-        if kinds.shape != (b, self.num_slots) or slot_texts.shape != (b, self.num_slots, self.max_text_tokens):
-            raise ValueError("examples were built with a different num_slots or max_text_tokens")
+            if len(e.kinds) != self.num_slots or e.text_len != self.max_text_tokens:
+                raise ValueError("examples were built with a different num_slots or max_text_tokens")
+            context_mask[i, : len(e.context_ids)] = True
+            structure_mask[i, : len(e.structure_ids)] = True
+            if len(e.inventory_ids):
+                inventory[i, torch.from_numpy(e.inventory_ids.astype(np.int64))] = 1.0
+            kinds[i] = torch.from_numpy(e.kinds.astype(np.int64))
+            for m, ids in zip(e.text_slots.tolist(), e.text_ids, strict=True):
+                slot_texts[i, m, : len(ids)] = torch.from_numpy(ids.astype(np.int64))
         text_mask = torch.zeros(b, self.num_slots, dtype=torch.bool)
         for kind in TEXT_KINDS:
             text_mask |= kinds == kind
         batch = Batch(
-            context=context, context_mask=context_mask,
-            target=self._pad([e.target for e in examples], n, self.pad_id),
-            target_lengths=torch.tensor([len(e.target) for e in examples], dtype=torch.long),
-            structure=self._pad([e.structure for e in examples], t_len, self.pad_id),
+            context=self._pad([e.context_ids for e in examples], m_c, self.pad_id), context_mask=context_mask,
+            target=self._pad([e.target_ids for e in examples], n, self.pad_id),
+            target_lengths=torch.tensor([len(e.target_ids) for e in examples], dtype=torch.long),
+            structure=self._pad([e.structure_ids for e in examples], t_len, self.pad_id),
             structure_mask=structure_mask,
-            slot_index=self._pad([e.slot_index for e in examples], t_len, -1),
+            slot_index=self._pad([e.slot_index_ids for e in examples], t_len, -1),
             modes=torch.tensor([e.mode for e in examples], dtype=torch.long),
             slot_kinds=kinds, slot_texts=slot_texts, slot_text_mask=text_mask, inventory=inventory,
         )

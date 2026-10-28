@@ -238,6 +238,10 @@ class StageConfig(_Section):
     warmup_steps: int = Field(ge=0)
     weight_decay: float = Field(ge=0.0)
     max_steps: int = Field(ge=1)
+    grad_accum_steps: int = Field(
+        1, ge=1, description="Micro-batches per optimizer step (effective batch = batch_size x grad_accum_steps). "
+                             "Losses are averaged over the micro-batches; VICReg's batch statistics are computed "
+                             "per micro-batch.")
 
     @model_validator(mode="after")
     def _check_warmup(self) -> StageConfig:
@@ -292,6 +296,8 @@ class TrainingConfig(_Section):
         "reference", description="Mode u fed to g_phi in Stage 2: the reference mode (teacher forcing) or a draw "
                                  "from pi_phi^h. The plan itself is always predicted from the context.")
     readout_weight: float = Field(1.0, ge=0.0, description="Weight of the plan-readout loss in Stages 2-3.")
+    activation_checkpointing: bool = Field(
+        False, description="Recompute realizer blocks in the backward pass (less memory, ~30% more compute).")
     realizer_loss_reduction: Literal["mean", "sum"] = "mean"
     log_every: int = Field(10, ge=1)
     save_every: int = Field(1_000, ge=1)

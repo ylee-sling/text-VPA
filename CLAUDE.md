@@ -26,11 +26,15 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/engine/runtime.py` | — | DDP, bf16, AdamW groups, schedule, checkpoints, metric logging |
 | `text_vpa/inference/sampler.py` | Algorithm 1 | `PRJEPASampler`, `DepthAudit` (K + 3) |
 | `text_vpa/inference/energy_terms.py` | Sec. 3.3, Prop. 4 | energies, `PrefixLexer`, Prop. 4(d) check, network-free repair |
-| `text_vpa/data/` | Table 1, Sec. 5.1 | tokenizers, tree-sitter `TreeSitterASTExtractor` + `ModeExtractor`, dataset, collator, synthetic corpus |
+| `text_vpa/data/` | Table 1, Sec. 5.1 | tokenizers, tree-sitter `TreeSitterASTExtractor` + `ModeExtractor`, dataset (compact `Example`, cache, parallel build), collator, synthetic corpus |
+| `text_vpa/data/corpus.py` | Sec. 5.1 "Data" | corpus builder: permissive licenses, self-contained documented functions, AST dedup, 13-word-gram decontamination |
+| `text_vpa/evaluation/` | Sec. 5.2 | unbiased pass@k, resource-limited execution, HumanEval / MBPP tasks (`evaluate.py`) |
 | `text_vpa/utils/verification.py` | Sec. 4.6, App. B | NumPy port of the paper's numerical checks (Table 2) |
 | `text_vpa/utils/profiler.py` | Sec. 5.4, App. A.2 | roofline (Table 3), measured latency, simulated AR decoder |
-| `train.py`, `generate.py` | — | CLIs |
+| `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
+| `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
+| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline) |
 
 ## Commands
 
@@ -41,6 +45,7 @@ python -m pytest -m slow                     # convergence test (~2 min): each c
 ruff check .                                 # must pass
 python -m text_vpa.utils.verification        # Appendix B checks; must reproduce Table 2
 python -m text_vpa.utils.profiler --roofline # must reproduce Table 3
+python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference --out /tmp/he  # harness: 164/164
 ```
 
 ## Non-negotiable rules
@@ -100,5 +105,12 @@ python -m text_vpa.utils.profiler --roofline # must reproduce Table 3
 - **AdaLN.** "adaLN-single" (shared projection + per-block tables), zero-initialised gates.
 - **σ̄.** Plain RMS of Eq. 8 (VPA divided by √d γ*).
 - **Stage 3 EMA.** The momentum schedule restarts at m0 over the Stage-3 steps.
+- **Gradient accumulation.** `training.<stage>.grad_accum_steps`: micro-batch losses scaled by 1/k, DDP
+  all-reduce on the last one. VICReg statistics are per micro-batch and the spectral-norm power iteration
+  advances once per micro-batch (so accumulation is exact only for Eq. 12; tested with the iteration frozen).
+- **Examples.** `Example` stores int32 arrays and only the text slots' ids; the list properties rebuild the
+  dense layout. Never store per-token Python lists for a corpus (~100 KB per example at M = 256).
+- **Decontamination.** Drop a training function sharing any 13-word n-gram (identifiers and numbers) with
+  HumanEval / MBPP; punctuation tokens made shared signatures count as contamination.
 - **Not implemented.** FS-DFM distillation from a 1,024-step teacher; HLS-C bit-width / directive-legality
   energies; contract energies; the continuous-control solver.

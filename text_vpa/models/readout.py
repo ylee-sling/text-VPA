@@ -119,12 +119,13 @@ class PlanReadout(nn.Module):
         if bool(targets.text_mask.any()):
             feats = out.slot_features[targets.text_mask]                            # [n, hidden]
             gold = targets.texts[targets.text_mask]                                 # [n, L]
-            logits = self.text_logits(feats)
             # Texts are left-aligned: the tokens, then [PAD]s. The first [PAD] ends the text and is
-            # predicted; later [PAD]s are ignored.
+            # predicted; later [PAD]s are ignored. ``text_out`` acts on each position separately, so only
+            # the kept positions are projected to the vocabulary ([n_keep, S] instead of [n, L, S]).
             length = (gold != pad_id).sum(dim=1, keepdim=True)                      # [n, 1]
             keep = torch.arange(gold.shape[1], device=gold.device)[None, :] <= length
-            text = F.cross_entropy(logits[keep], gold[keep])
+            hidden = feats[:, None, :] + self.text_positions[None, : gold.shape[1], :]   # [n, L, hidden]
+            text = F.cross_entropy(self.text_out(hidden[keep]), gold[keep])
         else:
             text = out.kind_logits.sum() * 0.0
         inventory = F.binary_cross_entropy_with_logits(out.inventory_logits, targets.inventory)
