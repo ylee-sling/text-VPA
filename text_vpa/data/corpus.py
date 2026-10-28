@@ -40,12 +40,15 @@ import copy
 import glob
 import gzip
 import hashlib
+import http.client
 import json
 import logging
 import multiprocessing
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 import warnings
 from collections import Counter
@@ -188,20 +191,45 @@ def _with_license(source: SourceFile, assume_license: str | None) -> SourceFile:
     return source
 
 
+def _retry(action, what: str, attempts: int, base_delay: float):
+    """Run ``action`` up to ``attempts`` times with exponential backoff; HTTP 4xx (except 429) fail at once."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise
+            error: Exception = exc
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            error = exc
+        if attempt == attempts:
+            raise RuntimeError(f"{what} failed after {attempts} attempts: {error}") from error
+        delay = min(60.0, base_delay * 2 ** (attempt - 1))
+        logger.warning("%s failed (%s); retry %d/%d in %.0f s", what, error, attempt, attempts - 1, delay)
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: str = "train",
-                        max_files: int | None = None, token: str | None = None) -> list[Path]:
+                        max_files: int | None = None, token: str | None = None, attempts: int = 6,
+                        base_delay: float = 5.0) -> list[Path]:
     """Download the Parquet conversion of a Hugging Face dataset split (resumable: finished files are kept).
 
     Uses the Hub's ``/api/datasets/{dataset}/parquet/{config}/{split}`` listing; ``token`` (or ``HF_TOKEN``)
-    is sent for gated datasets. Each file is written to ``*.part`` and renamed when complete.
+    is sent for gated datasets. Each file is written to ``*.part``, checked against the server's
+    Content-Length, and renamed when complete; network errors are retried with exponential backoff.
     """
     token = token or os.environ.get("HF_TOKEN")
     headers = {"User-Agent": "text-vpa-corpus/1"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     listing = f"https://huggingface.co/api/datasets/{dataset}/parquet/{config}/{split}"
-    with urllib.request.urlopen(urllib.request.Request(listing, headers=headers), timeout=60) as response:
-        urls = json.loads(response.read().decode())
+
+    def fetch_listing() -> list:
+        with urllib.request.urlopen(urllib.request.Request(listing, headers=headers), timeout=60) as response:
+            return json.loads(response.read().decode())
+
+    urls = _retry(fetch_listing, f"listing {listing}", attempts, base_delay)
     if not isinstance(urls, list) or not urls:
         raise ValueError(f"no Parquet files listed at {listing}")
     out = Path(out_dir)
@@ -214,11 +242,21 @@ def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: s
             logger.info("keep %s", dest)
             continue
         part = dest.with_suffix(".part")
+
+        def fetch_file(url: str = url, part: Path = part) -> None:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=600) as response, \
+                    open(part, "wb") as handle:
+                header = getattr(response, "headers", None)
+                expected = header.get("Content-Length") if header is not None else None
+                written = 0
+                while chunk := response.read(1 << 22):
+                    handle.write(chunk)
+                    written += len(chunk)
+            if expected is not None and written != int(expected):
+                raise ValueError(f"truncated download: {written} of {expected} bytes")
+
         logger.info("download %s -> %s", url, dest)
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=600) as response, \
-                open(part, "wb") as handle:
-            while chunk := response.read(1 << 22):
-                handle.write(chunk)
+        _retry(fetch_file, f"download {url}", attempts, base_delay)
         part.replace(dest)
     return paths
 

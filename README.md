@@ -22,7 +22,7 @@ actions to discrete tokens.
 > [!IMPORTANT]
 > **A research prototype with equation-level verification. No trained checkpoints and no benchmark results
 > yet.** The paper's evaluation protocol (Sec. 5) has not been run. What is verified:
-> - 1,114 unit and integration tests check every equation against independent float64 references, the
+> - 1,116 unit and integration tests check every equation against independent float64 references, the
 >   K + 3 depth, Proposition 4(d), and the Stage-2 anti-leakage invariant;
 > - the Pass@k harness passes every HumanEval reference solution (164/164) and 499/500 of MBPP's test split;
 > - `scripts/gcp/train_l4.sh` (corpus → Stage 1 → Stage 2 → Pass@k) runs end to end and resumes after an
@@ -195,16 +195,53 @@ The `l4` presets fit one NVIDIA L4 (24 GB) with 64 GB of host memory (GCP `g2-st
 - a 32K BPE vocabulary;
 - bf16, activation checkpointing, and micro-batches of 16 × 4 accumulation steps (B = 64).
 
-```bash
-# on your machine: create the VM (Deep Learning VM image, Ubuntu 24.04, NVIDIA driver 580)
-ZONE=asia-northeast3-b scripts/gcp/create_vm.sh            # PROVISIONING=SPOT for a preemptible VM
-gcloud compute ssh text-vpa-l4 --zone asia-northeast3-b
+### 1. Create the VM
 
-# on the VM
-git clone https://github.com/ylee-sling/text-VPA.git && cd text-VPA
-bash scripts/gcp/setup_vm.sh       # venv, pinned deps, GPU check, HumanEval/MBPP, harness check, tests
-tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'
+Use the Cloud Console (**Compute Engine → VM instances → Create instance**), or `scripts/gcp/create_vm.sh`.
+
+| Setting | Value |
+|---|---|
+| Region / zone | a region where you have L4 quota (e.g. `asia-northeast3`, Seoul); a zone that offers L4 |
+| Machine configuration | **GPUs** → GPU type **NVIDIA L4**, number **1** → machine type **`g2-standard-16`** (16 vCPU, 64 GB) |
+| VM provisioning model | **Standard** (Spot is cheaper but can be stopped at any time) |
+| On host maintenance / automatic restart | **Terminate VM instance** (required with a GPU) / **On** |
+| Boot disk image | **Deep Learning on Linux**, the Ubuntu 24.04 version with CUDA 12.9 and NVIDIA driver 580 (image family `common-cu129-ubuntu-2404-nvidia-580`). Ubuntu 22.04 has Python 3.10, too old for the pinned requirements. |
+| Boot disk type / size | **Balanced persistent disk**, **200 GB** (image, Python environment ~10 GB, corpus and cache, checkpoints ~15 GB) |
+| Identity and API access | Compute Engine default service account, **Allow default access**. Choose Storage **Read Write** only if you set `GCS` to back up `runs/` to a bucket. |
+| Networking | an external IPv4 address (ephemeral is fine): the run downloads from Hugging Face, PyPI and GitHub |
+| Shielded VM | leave **Secure Boot** off (the default) |
+
+New projects usually need an L4 GPU quota increase in the region first. If a zone has no free L4 capacity, try
+another zone of the region.
+
+### 2. Run everything unattended (one command)
+
+In the VM's **SSH** window (or `gcloud compute ssh VM --zone ZONE --command '...'` from your machine):
+
+```bash
+[ -d ~/text-VPA ] || git clone https://github.com/ylee-sling/text-VPA.git ~/text-VPA; bash ~/text-VPA/scripts/gcp/run_all.sh
 ```
+
+`scripts/gcp/run_all.sh` returns at once. The work runs in the detached tmux session `textvpa`, so closing the SSH
+window does not stop it, and is logged to `~/text-VPA/runs/logs/run-<timestamp>.log`. Watch it with
+`tail -f ~/text-VPA/runs/logs/latest.log` or `tmux attach -t textvpa` (detach: Ctrl-b d).
+
+The session runs these steps in order:
+1. checks the GPU and driver with `nvidia-smi`;
+2. installs the system packages (`apt-get -y`) and the pinned Python environment (`.venv`);
+3. checks that PyTorch runs on the GPU, downloads HumanEval and MBPP, and checks the Pass@k harness on their reference solutions;
+4. runs the test suite (failures are reported, not fatal);
+5. runs the memory check, falling back to smaller micro-batches with more accumulation if needed;
+6. runs `scripts/gcp/train_l4.sh`: corpus, Stage 1 (50K steps), Stage 2 (100K steps), Pass@k on HumanEval and MBPP.
+
+When the run ends, the VM shuts itself down (`shutdown -h +1`), after a failure too. Use `SHUTDOWN_ON_FAILURE=0`
+to keep it up. Logs, checkpoints and results stay on the boot disk. If the VM restarts unexpectedly (host
+maintenance), an `@reboot` entry restarts the run, and it resumes from the last checkpoint. `run_all.sh
+--status` shows the state; `run_all.sh --cancel` stops the run without shutting down. Times in the log are the
+VM's clock (UTC). Settings are environment variables, such as `STAGE2_STEPS=30000 bash .../run_all.sh`.
+
+Step by step instead: `bash scripts/gcp/setup_vm.sh`, then
+`tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'`.
 
 `train_l4.sh` runs these steps in order:
 1. download and build the corpus;
@@ -214,10 +251,8 @@ tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'
 5. Pass@k on HumanEval and MBPP.
 
 Re-running the same command after a stop skips finished steps and resumes the interrupted stage from its last
-checkpoint (every 1,000 steps). Use this after a Spot preemption. Set `GCS=gs://BUCKET/PATH` to copy `runs/` to
-Cloud Storage every 30 minutes. Every setting is a variable at the top of the script.
-- **GPU quota:** new projects usually need an L4 GPU quota increase in the region first.
-- **Zone:** list zones with L4 GPUs with `gcloud compute accelerator-types list --filter=name=nvidia-l4`.
+checkpoint (every 1,000 steps). Set `GCS=gs://BUCKET/PATH` to copy `runs/` to Cloud Storage every 30 minutes.
+Every setting is a variable at the top of the script.
 
 ## Evaluation (Pass@k)
 

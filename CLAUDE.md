@@ -34,7 +34,7 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
 | `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
-| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline) |
+| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown) |
 
 ## Commands
 

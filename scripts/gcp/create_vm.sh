@@ -51,7 +51,5 @@ cat <<EOF
 
 VM $NAME created in $ZONE. Next:
   gcloud compute ssh $NAME --zone $ZONE --project $PROJECT
-  git clone https://github.com/ylee-sling/text-VPA.git && cd text-VPA
-  bash scripts/gcp/setup_vm.sh
-  tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'
+  [ -d ~/text-VPA ] || git clone https://github.com/ylee-sling/text-VPA.git ~/text-VPA; bash ~/text-VPA/scripts/gcp/run_all.sh
 EOF

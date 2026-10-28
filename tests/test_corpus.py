@@ -360,3 +360,61 @@ def test_download_lists_and_fetches_parquet_files_resumably(tmp_path, monkeypatc
     download_hf_parquet("org/ds", "Python-all", tmp_path, max_files=2)          # nothing to fetch again
     assert [url for url, _ in requested] == [requested[0][0]]
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_retries_transient_errors_and_truncated_files(tmp_path, monkeypatch) -> None:
+    """A dropped connection and a short body (fewer bytes than Content-Length) are retried; the file is kept
+    only when complete."""
+    import urllib.error
+
+    calls = {"listing": 0, "file": 0}
+    sleeps: list[float] = []
+
+    class Sized(_Response):
+        def __init__(self, body: bytes, declared: int) -> None:
+            super().__init__(body)
+            self.headers = {"Content-Length": str(declared)}
+
+    def flaky_urlopen(request, timeout=0):
+        if request.full_url.endswith("/parquet/cfg/train"):
+            calls["listing"] += 1
+            if calls["listing"] == 1:
+                raise urllib.error.URLError("connection reset")
+            return _Response(json.dumps(["https://example.org/0.parquet"]).encode())
+        calls["file"] += 1
+        if calls["file"] == 1:
+            return Sized(b"PAR1-trunc", 20)                         # 10 of 20 bytes, then the stream ends
+        return Sized(b"PAR1-complete-file!!", 20)
+
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(corpus_module.time, "sleep", sleeps.append)
+    paths = download_hf_parquet("org/ds", "cfg", tmp_path, attempts=3, base_delay=2.0)
+    assert paths[0].read_bytes() == b"PAR1-complete-file!!"
+    assert calls == {"listing": 2, "file": 2} and sleeps == [2.0, 2.0]          # one retry each
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_gives_up_after_the_attempts_and_does_not_retry_404(tmp_path, monkeypatch) -> None:
+    import urllib.error
+
+    attempts = {"n": 0}
+
+    def always_down(request, timeout=0):
+        attempts["n"] += 1
+        raise urllib.error.URLError("network unreachable")
+
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", always_down)
+    monkeypatch.setattr(corpus_module.time, "sleep", lambda _s: None)
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        download_hf_parquet("org/ds", "cfg", tmp_path, attempts=3)
+    assert attempts["n"] == 3
+
+    def not_found(request, timeout=0):
+        attempts["n"] += 1
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    attempts["n"] = 0
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", not_found)
+    with pytest.raises(urllib.error.HTTPError):
+        download_hf_parquet("org/ds", "cfg", tmp_path, attempts=3)
+    assert attempts["n"] == 1

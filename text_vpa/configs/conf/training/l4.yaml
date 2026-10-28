@@ -24,7 +24,7 @@ joint:
   planner_lr_scale: 0.1
 grad_clip_norm: 1.0
 collapse_check_every: 1000
-collapse_grace_steps: 2000
+collapse_grace_steps: 5000      # ~ one epoch of a ~300K-function corpus at B = 64 (the paper checks per epoch)
 seed: 0
 device: auto
 precision: bf16            # the L4 (Ada) supports bfloat16
