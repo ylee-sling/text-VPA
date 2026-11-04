@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.nn.utils import parametrize
 
 import train as train_cli
-from tests.conftest import ATOL, RTOL
+from tests.conftest import ATOL, RTOL, accelerator
 from text_vpa.configs import load_config
 from text_vpa.data.dataset import MixtureCorruption, PRJEPACollator, PRJEPADataset, build_dataloader
 from text_vpa.data.synthetic import TEMPLATES, synthetic_corpus
@@ -301,6 +301,36 @@ def test_rng_state_round_trip() -> None:
     assert torch.equal(first[0], second[0]) and first[1] == second[1]
 
 
+def test_rng_state_restores_from_tensors_that_are_not_cpu_byte_tensors() -> None:
+    """A checkpoint loaded with map_location=<GPU> holds the generator state as a CUDA tensor, which
+    torch.set_rng_state rejects ("RNG state must be a torch.ByteTensor"; it broke every Stage-1 resume on the
+    L4). The same TypeError comes from any tensor that is not a CPU uint8 tensor, so an int64 copy stands in
+    for the CUDA one here; set_rng_state must restore the stream from it."""
+    state = rng_state()
+    expected = torch.rand(8)
+    moved = dict(state, torch=state["torch"].to(torch.int64))
+    set_rng_state(moved)
+    assert torch.equal(torch.rand(8), expected)
+
+
+def test_rng_state_survives_a_checkpoint_loaded_onto_the_accelerator(tmp_path) -> None:
+    """save_checkpoint -> load_checkpoint(map_location=<accelerator>) -> set_rng_state restores the CPU stream
+    (and the CUDA streams on CUDA), as Stage1Trainer.resume and Stage2Trainer.resume do."""
+    device = accelerator()
+    if device is None:
+        pytest.skip("no CUDA/ROCm/MPS device available")
+    state = rng_state()
+    expected_cpu = torch.rand(8)
+    expected_cuda = torch.rand(8, device="cuda") if device.type == "cuda" else None
+    save_checkpoint(tmp_path / "rng.pt", {"rng": state})
+    loaded = load_checkpoint(tmp_path / "rng.pt", map_location=device)
+    assert loaded["rng"]["torch"].device.type == device.type          # the situation of the failed resume
+    set_rng_state(loaded["rng"])
+    assert torch.equal(torch.rand(8), expected_cpu)
+    if expected_cuda is not None:
+        assert torch.equal(torch.rand(8, device="cuda"), expected_cuda)
+
+
 # =============================================================================================
 # Stage 1
 # =============================================================================================
@@ -486,6 +516,25 @@ def test_stage1_resume_continues_like_uninterrupted_training(tmp_path, tokenizer
     assert torch.equal(torch.get_rng_state(), saved["rng"]["torch"])
     resumed.train(max_steps=4)                                          # steps 3 and 4 on batches 3 and 4
     assert_same_state(resumed, full)
+
+
+def test_stage1_resume_on_the_accelerator(tmp_path, tokenizer, corpus) -> None:
+    """Stage1Trainer.resume loads its checkpoint onto the training device; on a GPU that made the generator
+    state a CUDA tensor and every resume failed. The resumed run must load and keep training."""
+    device = accelerator()
+    if device is None:
+        pytest.skip("no CUDA/ROCm/MPS device available")
+    ctx = DistributedContext(device=device)
+    cfg = make_cfg(tokenizer, "training.save_every=2")
+    batches = make_batches(cfg, tokenizer, corpus, 4, 4)
+    first = Stage1Trainer(cfg, new_planner(cfg), tokenizer, batches, tmp_path / "first", ctx, quiet(tmp_path))
+    first.train(max_steps=2)
+    resumed = Stage1Trainer(cfg, new_planner(cfg, seed=99), tokenizer, batches[2:], tmp_path / "resumed", ctx,
+                            quiet(tmp_path))
+    resumed.resume(tmp_path / "first" / "stage1_last.pt")
+    assert resumed.step == 2
+    resumed.train(max_steps=4)
+    assert resumed.step == 4
 
 
 def test_stage1_resume_with_the_bucketed_loader_continues_like_uninterrupted(tmp_path, tokenizer, corpus) -> None:

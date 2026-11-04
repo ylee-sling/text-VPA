@@ -163,11 +163,17 @@ def rng_state() -> dict[str, Any]:
     return state
 
 
+def _generator_bytes(state: torch.Tensor) -> torch.Tensor:
+    """A generator state as the CPU uint8 tensor torch expects: a checkpoint loaded with
+    ``map_location=<GPU>`` holds it on the GPU, which torch.set_rng_state rejects."""
+    return state.detach().to(device="cpu", dtype=torch.uint8)
+
+
 def set_rng_state(state: dict[str, Any]) -> None:
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_generator_bytes(state["torch"]))
     random.setstate((3, tuple(state["python"]), state["python_pos"]))
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([_generator_bytes(s) for s in state["cuda"]])
 
 
 # =============================================================================================
