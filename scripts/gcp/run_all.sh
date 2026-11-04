@@ -28,9 +28,20 @@
 #   bash ~/text-VPA/scripts/gcp/run_all.sh --status   # running or not, outcome markers, last log lines
 #   bash ~/text-VPA/scripts/gcp/run_all.sh --cancel   # stop the run without shutting down; no restart on boot
 #
+# A VM reused from another project: check it first with scripts/gcp/preflight.sh (read-only). The run itself
+# - uses its own .venv (recreated if it is broken or older than Python 3.12); without a system Python >= 3.12
+#   (e.g. Ubuntu 22.04) it installs a standalone Python 3.12 with uv into .python/ -- nothing outside the
+#   repository changes;
+# - clears settings another project may pass on, also through a tmux server started earlier (PYTHONPATH,
+#   PYTHONHOME, LD_LIBRARY_PATH, LD_PRELOAD, conda and venv variables, PIP_* and pip.conf files); the
+#   launching shell's CUDA_VISIBLE_DEVICES (set or unset) is the one the run gets;
+# - installs PyTorch's CUDA 13.0 build (PyPI) for NVIDIA driver 580 or newer, its CUDA 12.6 build for 525-579.
+#
 # Settings (environment variables, saved for restarts): everything train_l4.sh reads (STAGE1_STEPS [50000],
 # STAGE2_STEPS [100000], NUM_SAMPLES [10], GCS, HF_FILES, ...), and SHUTDOWN_ON_SUCCESS [1],
-# SHUTDOWN_ON_FAILURE [1], SHUTDOWN_DELAY_MIN [1], RUN_TESTS [1], TRAIN_ATTEMPTS [3].
+# SHUTDOWN_ON_FAILURE [1], SHUTDOWN_DELAY_MIN [1], RUN_TESTS [1], TRAIN_ATTEMPTS [3], PYTHON [auto: the
+# interpreter for a new .venv, a path or "uv" for the standalone one], TORCH_INDEX_URL [by driver],
+# KEEP_ENV [0], UV_VERSION [0.13.2].
 set -Eeuo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -43,7 +54,7 @@ CRON_TAG="# text-vpa-run-all"
 SAVED_VARS=(RUN DATA HF_DATASET HF_CONFIG HF_FILES HF_TOKEN CORPUS_SOURCE CORPUS_LICENSE PRESET STAGE2_PRESET
   STAGE1_STEPS STAGE2_STEPS EVAL_EVERY NUM_SAMPLES EVAL_LIMIT DEVICE GCS SYNC_MINUTES SHUTDOWN_ON_SUCCESS
   SHUTDOWN_ON_FAILURE SHUTDOWN_DELAY_MIN NO_SHUTDOWN RUN_TESTS TRAIN_ATTEMPTS SKIP_GPU_CHECK SKIP_APT SESSION
-  MIN_FREE_GB)
+  MIN_FREE_GB PYTHON TORCH_INDEX_URL KEEP_ENV UV_VERSION)
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "error: $*" >&2; exit 1; }
@@ -107,6 +118,12 @@ launch() {
     for name in "${SAVED_VARS[@]}"; do
       if [[ -n "${!name+x}" ]]; then printf 'export %s=%q\n' "$name" "${!name}" >> "$ENV_FILE"; fi
     done
+    # The run gets this shell's GPU selection, not a stale one from the environment of a tmux server.
+    if [[ -n "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+      printf 'export CUDA_VISIBLE_DEVICES=%q\n' "$CUDA_VISIBLE_DEVICES" >> "$ENV_FILE"
+    else
+      echo "unset CUDA_VISIBLE_DEVICES" >> "$ENV_FILE"
+    fi
   fi
   local stamp logfile
   stamp="$(date +%Y%m%d-%H%M%S)"
@@ -119,7 +136,14 @@ launch() {
   echo "  watch:   tail -f $LOG_DIR/latest.log      (or: tmux attach -t $SESSION, then Ctrl-b d to detach)"
   echo "  status:  bash $SELF --status"
   echo "  cancel:  bash $SELF --cancel"
-  echo "The VM shuts itself down when the run ends. You can close this window now."
+  if [[ "${NO_SHUTDOWN:-0}" == 1 ]]; then
+    echo "NO_SHUTDOWN=1: the shutdown at the end is only logged. You can close this window now."
+  elif [[ "${SHUTDOWN_ON_SUCCESS:-1}" == 1 || "${SHUTDOWN_ON_FAILURE:-1}" == 1 ]]; then
+    echo "The VM shuts itself down when the run ends (SHUTDOWN_ON_SUCCESS=${SHUTDOWN_ON_SUCCESS:-1}," \
+         "SHUTDOWN_ON_FAILURE=${SHUTDOWN_ON_FAILURE:-1}). You can close this window now."
+  else
+    echo "The VM keeps running when the run ends. You can close this window now."
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -193,18 +217,95 @@ step_gpu() {
   cuda="$(nvidia-smi | grep -o 'CUDA Version: *[0-9.]*' | head -1 || true)"
   log "GPU $name, driver $driver, ${cuda:-CUDA version unknown}"
   [[ "$name" == *L4* ]] || log "warning: expected an NVIDIA L4, found '$name' (the l4 presets may not fit)"
+  local major="${driver%%.*}"
+  if [[ "$major" =~ ^[0-9]+$ ]]; then
+    (( major >= 525 )) || die "NVIDIA driver $driver is too old for PyTorch 2.14 (its CUDA 12.6 build needs 525" \
+      "or newer, the CUDA 13.0 build 580 or newer); update the driver, e.g. sudo /opt/deeplearning/install-driver.sh"
+    (( major >= 580 )) || log "driver $driver is older than 580: PyTorch's CUDA 12.6 build will be installed"
+  fi
 }
 
-pick_python() {   # the system Python first: some images put an older conda Python first on PATH
-  local candidate
-  for candidate in /usr/bin/python3.12 /usr/bin/python3 python3.12 python3; do
+# ---------------------------------------------------------------------------------------------
+# Environment, Python and PyTorch
+# ---------------------------------------------------------------------------------------------
+clean_environment() {   # a reused VM may pass another project's settings on, also through a tmux server
+  if [[ "${KEEP_ENV:-0}" == 1 ]]; then log "KEEP_ENV=1: the inherited environment is kept"; return 0; fi
+  local name removed=()
+  # pip's network settings (PIP_CERT, PIP_CLIENT_CERT, PIP_PROXY, PIP_TRUSTED_HOST) are kept; the others
+  # (PIP_INDEX_URL, PIP_USER, PIP_CONSTRAINT, ...) would change what gets installed.
+  for name in PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE VIRTUAL_ENV CONDA_PREFIX CONDA_DEFAULT_ENV \
+      CONDA_SHLVL LD_LIBRARY_PATH LD_PRELOAD \
+      $(compgen -e | grep -E '^PIP_' | grep -vxE 'PIP_(CERT|CLIENT_CERT|PROXY|TRUSTED_HOST)' || true); do
+    if [[ -n "${!name+x}" ]]; then
+      removed+=("$name")
+      unset "$name"
+    fi
+  done
+  export PIP_CONFIG_FILE=/dev/null     # pip.conf files (user = true, another index, constraints) do not apply
+  export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin${PATH:+:$PATH}"
+  if [[ ${#removed[@]} -gt 0 ]]; then log "cleared inherited settings for this run: ${removed[*]}"; fi
+}
+
+pick_python() {   # PYTHON; else the system Python first (some images put an older conda Python first on PATH)
+  local candidate candidates=(/usr/bin/python3.12 /usr/bin/python3 python3.12 python3)
+  [[ -n "${PYTHON:-}" && "$PYTHON" != uv ]] && candidates=("$PYTHON")
+  for candidate in "${candidates[@]}"; do
     if command -v "$candidate" >/dev/null 2>&1 \
         && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-      echo "$candidate"
+      command -v "$candidate"
       return 0
     fi
   done
   return 1
+}
+
+provision_python() {   # prints the path of a standalone CPython 3.12 under $ROOT/.python (installed with uv)
+  local base boot="$ROOT/.python/bootstrap" version="${UV_VERSION:-0.13.2}"
+  base="$(command -v /usr/bin/python3 || command -v python3 || true)"
+  [[ -n "$base" ]] || { log "error: no python3 to install uv with" >&2; return 1; }
+  local why
+  why="no Python >= 3.12 here ($("$base" -V 2>&1))"
+  [[ "${PYTHON:-}" == uv ]] && why="PYTHON=uv"
+  if [[ ! -x "$boot/bin/uv" ]]; then
+    log "$why: installing a standalone Python 3.12 into $ROOT/.python with uv $version" \
+      "(nothing outside the repository changes)" >&2
+    rm -rf "$boot"
+    "$base" -m venv "$boot" >&2 || { log "error: $base -m venv failed (install python3-venv)" >&2; return 1; }
+    "$boot/bin/python" -m pip install -q --no-cache-dir --retries 10 --timeout 60 "uv==$version" >&2 \
+      || { log "error: could not install uv from PyPI" >&2; return 1; }
+  fi
+  # uv without another project's uv settings (UV_* variables but its TLS ones, uv.toml files); env takes its
+  # -u options before the assignments
+  local name uv_env=(env)
+  for name in $(compgen -e | grep -E '^UV_' | grep -vxE 'UV_(NATIVE_TLS|SYSTEM_CERTS|INSECURE_HOST|HTTP_TIMEOUT)' || true); do
+    uv_env+=(-u "$name")
+  done
+  uv_env+=(UV_NO_CONFIG=1 UV_PYTHON_INSTALL_DIR="$ROOT/.python" UV_CACHE_DIR="$ROOT/.python/cache")
+  "${uv_env[@]}" "$boot/bin/uv" python install --no-bin 3.12 >&2 \
+    || { log "error: uv could not download Python 3.12 (from GitHub)" >&2; return 1; }
+  "${uv_env[@]}" "$boot/bin/uv" python find --managed-python 3.12
+}
+
+torch_index_url() {   # PyTorch 2.14 builds: CUDA 13.0 on PyPI (driver >= 580), CUDA 12.6 (driver >= 525)
+  if [[ -n "${TORCH_INDEX_URL:-}" ]]; then echo "$TORCH_INDEX_URL"; return 0; fi
+  [[ "${SKIP_GPU_CHECK:-0}" == 1 ]] && return 0
+  local driver
+  driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+  driver="${driver%%.*}"
+  if [[ "$driver" =~ ^[0-9]+$ ]] && (( driver < 580 )); then echo "https://download.pytorch.org/whl/cu126"; fi
+  return 0
+}
+
+install_torch() {   # the torch pin of requirements.txt, from INDEX (a PyTorch wheel index) if given
+  local index="${1:-}" pin current
+  [[ -n "$index" ]] || return 0             # the PyPI build comes with requirements.txt
+  pin="$(grep -E '^torch==' "$ROOT/requirements.txt" | head -1)"
+  current="$(python -m pip show torch 2>/dev/null | sed -n 's/^Version: //p')"
+  [[ "$current" == "${pin#torch==}+${index##*/}" ]] && return 0        # e.g. 2.14.1+cu126 is installed
+  log "installing PyTorch ${pin#torch==} from $index"
+  if [[ -n "$current" ]]; then python -m pip uninstall -y -q torch; fi
+  python -m pip install -q --no-cache-dir --retries 10 --timeout 60 "$pin" --index-url "$index" \
+    --extra-index-url https://pypi.org/simple
 }
 
 step_system() {
@@ -215,13 +316,32 @@ step_system() {
     sudo -n systemctl enable --now cron >/dev/null 2>&1 || true
   fi
   cron_install
-  local python_bin
-  python_bin="$(pick_python)" \
-    || die "Python >= 3.12 is required (found $(python3 -V 2>&1)); use an Ubuntu 24.04 Deep Learning VM image"
-  [[ -x "$ROOT/.venv/bin/python" ]] || "$python_bin" -m venv "$ROOT/.venv"
+  if [[ -e "$ROOT/.venv" ]] \
+      && ! "$ROOT/.venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+    log "the existing .venv is broken or older than Python 3.12: recreating it"
+    rm -rf "$ROOT/.venv"
+  fi
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    log "reusing .venv (Python $("$ROOT/.venv/bin/python" -V 2>&1 | cut -d' ' -f2))"
+  else
+    local python_bin=""
+    if [[ "${PYTHON:-}" != uv ]]; then python_bin="$(pick_python)" || python_bin=""; fi
+    if [[ -z "$python_bin" ]]; then
+      [[ -z "${PYTHON:-}" || "$PYTHON" == uv ]] || die "PYTHON=$PYTHON is not a working Python >= 3.12"
+      python_bin="$(provision_python)" || die "no Python 3.12 (see above); install one and set PYTHON=/path/to/python3.12"
+    fi
+    if [[ "$python_bin" == /usr/bin/* && "${SKIP_APT:-0}" != 1 ]] && ! "$python_bin" -c 'import ensurepip' 2>/dev/null; then
+      local venv_pkg   # e.g. python3.12-venv for deadsnakes' python3.12 on Ubuntu 22.04
+      venv_pkg="python$("$python_bin" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-venv"
+      "${APT[@]}" install "$venv_pkg" >/dev/null || log "warning: could not install $venv_pkg"
+    fi
+    log "creating .venv with $python_bin ($("$python_bin" -V 2>&1))"
+    "$python_bin" -m venv "$ROOT/.venv"
+  fi
   # shellcheck disable=SC1091
   source "$ROOT/.venv/bin/activate"
   python -m pip install -q --no-cache-dir --upgrade pip
+  install_torch "$(torch_index_url)"
   python -m pip install -q --no-cache-dir --retries 10 --timeout 60 -r "$ROOT/requirements-dev.txt"
   python -m pip install -q --no-cache-dir --no-deps -e "$ROOT"
   log "Python $(python -V 2>&1 | cut -d' ' -f2), torch $(python -c 'import torch; print(torch.__version__)')"
@@ -230,12 +350,10 @@ step_system() {
 step_torch() {
   log "3/7 PyTorch on the GPU, evaluation sets, Pass@k harness"
   if [[ "${SKIP_GPU_CHECK:-0}" != 1 ]]; then
-    if ! python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)'; then
-      local version
-      version="$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
-      log "PyTorch $version does not see the GPU; trying its CUDA 12.8 build"
-      python -m pip install -q --no-cache-dir --force-reinstall "torch==$version" \
-        --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple || true
+    if ! python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)' \
+        && [[ "$(python -c 'import torch; print(torch.version.cuda or "")')" != 12.6 ]]; then
+      log "PyTorch $(python -c 'import torch; print(torch.__version__)') does not see the GPU; trying its CUDA 12.6 build"
+      install_torch https://download.pytorch.org/whl/cu126 || true
     fi
     python - <<'EOF'
 import torch
@@ -351,6 +469,7 @@ worker() {
     # shellcheck disable=SC1090
     source "$ENV_FILE"
   fi
+  clean_environment
   export DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
   export RUN="${RUN:-runs/l4}" DATA="${DATA:-data}"
   export PRESET="${PRESET:-planner=base realizer=l4 data=code training=l4}"
@@ -362,7 +481,8 @@ worker() {
   trap 'finish 129' HUP
   trap 'finish 143' TERM
   log "text-VPA unattended run on $(hostname): commit $(git -C "$ROOT" log -1 --format='%h %s' 2>/dev/null || echo unknown)"
-  log "settings: STAGE1_STEPS=${STAGE1_STEPS:-50000} STAGE2_STEPS=${STAGE2_STEPS:-100000} NUM_SAMPLES=${NUM_SAMPLES:-10} RUN=$RUN"
+  log "settings: STAGE1_STEPS=${STAGE1_STEPS:-50000} STAGE2_STEPS=${STAGE2_STEPS:-100000} NUM_SAMPLES=${NUM_SAMPLES:-10} RUN=$RUN" \
+    "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>}"
   step_gpu
   step_system
   step_torch
@@ -409,6 +529,6 @@ case "${1:-}" in
   --worker) worker ;;
   --status) status ;;
   --cancel) cancel ;;
-  -h|--help) sed -n '5,33p' "$SELF" ;;
+  -h|--help) sed -n '5,44p' "$SELF" ;;
   *) echo "unknown argument: $1 (use --status, --cancel or no argument)" >&2; exit 2 ;;
 esac

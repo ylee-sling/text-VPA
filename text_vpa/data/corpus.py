@@ -49,6 +49,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import warnings
 from collections import Counter
@@ -69,6 +70,7 @@ __all__ = [
     "extract_functions",
     "is_permissive",
     "iter_sources",
+    "parquet_tree_urls",
 ]
 
 logger = logging.getLogger(__name__)
@@ -210,12 +212,61 @@ def _retry(action, what: str, attempts: int, base_delay: float):
     raise AssertionError("unreachable")
 
 
+_PARQUET_REVISION = urllib.parse.quote("refs/convert/parquet", safe="")
+_NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+def _get_json(url: str, headers: dict[str, str]) -> tuple[Any, str | None]:
+    """GET ``url`` as JSON; also returns the ``rel="next"`` URL of a paginated Hub listing (or None)."""
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+        body = json.loads(response.read().decode())
+        header = getattr(response, "headers", None)
+        link = header.get("Link") if header is not None else None
+    match = _NEXT_LINK.search(link or "")
+    return body, match.group(1) if match else None
+
+
+def parquet_tree_urls(dataset: str, config: str, split: str = "train", headers: dict[str, str] | None = None,
+                      attempts: int = 6, base_delay: float = 5.0, max_pages: int = 100) -> list[str]:
+    """Download URLs of a split's files in the dataset's Parquet export (the ``refs/convert/parquet`` branch).
+
+    The fallback when the ``/parquet`` listing has none: exports of large datasets are partial and have been
+    stored under ``{config}/partial-{split}/`` and ``{config}/partial/{split}/`` as well as ``{config}/{split}/``.
+    Files are returned in path (shard) order; an unknown dataset or config gives an empty list.
+    """
+    headers = dict(headers or {"User-Agent": "text-vpa-corpus/1"})
+    folders = {f"{config}/{split}", f"{config}/partial-{split}", f"{config}/partial/{split}"}
+    url: str | None = (f"https://huggingface.co/api/datasets/{dataset}/tree/{_PARQUET_REVISION}/"
+                       f"{urllib.parse.quote(config)}?recursive=true")
+    paths: list[str] = []
+    for _ in range(max_pages):
+        if url is None:
+            break
+        page_url = url
+        try:
+            entries, url = _retry(lambda page_url=page_url: _get_json(page_url, headers), f"tree {page_url}",
+                                  attempts, base_delay)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return []
+            raise
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", ""))
+            if entry.get("type") == "file" and path.endswith(".parquet") and path.rsplit("/", 1)[0] in folders:
+                paths.append(path)
+    return [f"https://huggingface.co/datasets/{dataset}/resolve/{_PARQUET_REVISION}/{urllib.parse.quote(p)}"
+            for p in sorted(paths)]
+
+
 def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: str = "train",
                         max_files: int | None = None, token: str | None = None, attempts: int = 6,
                         base_delay: float = 5.0) -> list[Path]:
     """Download the Parquet conversion of a Hugging Face dataset split (resumable: finished files are kept).
 
-    Uses the Hub's ``/api/datasets/{dataset}/parquet/{config}/{split}`` listing; ``token`` (or ``HF_TOKEN``)
+    Uses the Hub's ``/api/datasets/{dataset}/parquet/{config}/{split}`` listing and, when that lists no files
+    (404 or empty), the files of the Parquet export's tree (``parquet_tree_urls``). ``token`` (or ``HF_TOKEN``)
     is sent for gated datasets. Each file is written to ``*.part``, checked against the server's
     Content-Length, and renamed when complete; network errors are retried with exponential backoff.
     """
@@ -224,14 +275,18 @@ def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: s
     if token:
         headers["Authorization"] = f"Bearer {token}"
     listing = f"https://huggingface.co/api/datasets/{dataset}/parquet/{config}/{split}"
-
-    def fetch_listing() -> list:
-        with urllib.request.urlopen(urllib.request.Request(listing, headers=headers), timeout=60) as response:
-            return json.loads(response.read().decode())
-
-    urls = _retry(fetch_listing, f"listing {listing}", attempts, base_delay)
+    try:
+        urls, _ = _retry(lambda: _get_json(listing, headers), f"listing {listing}", attempts, base_delay)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        urls = None
     if not isinstance(urls, list) or not urls:
-        raise ValueError(f"no Parquet files listed at {listing}")
+        urls = parquet_tree_urls(dataset, config, split, headers, attempts, base_delay)
+        if not urls:
+            raise ValueError(f"no Parquet files for {dataset} ({config}/{split}): none listed at {listing} "
+                             "nor in the refs/convert/parquet tree")
+        logger.info("%s lists no files; using the %d file(s) of the Parquet export's tree", listing, len(urls))
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     paths = []

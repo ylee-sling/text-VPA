@@ -415,6 +415,71 @@ def test_download_gives_up_after_the_attempts_and_does_not_retry_404(tmp_path, m
 
     attempts["n"] = 0
     monkeypatch.setattr(corpus_module.urllib.request, "urlopen", not_found)
-    with pytest.raises(urllib.error.HTTPError):
+    with pytest.raises(ValueError, match="no Parquet files"):
+        download_hf_parquet("org/ds", "cfg", tmp_path, attempts=3)
+    assert attempts["n"] == 2                     # the listing, then the export's tree; a 404 is never retried
+
+    def forbidden(request, timeout=0):
+        attempts["n"] += 1
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+
+    attempts["n"] = 0
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", forbidden)
+    with pytest.raises(urllib.error.HTTPError):   # e.g. a gated dataset without HF_TOKEN: no fallback
         download_hf_parquet("org/ds", "cfg", tmp_path, attempts=3)
     assert attempts["n"] == 1
+
+
+class _Paged(_Response):
+    def __init__(self, body: bytes, link: str | None = None) -> None:
+        super().__init__(body)
+        self.headers = {"Link": link} if link else {}
+
+
+@pytest.mark.parametrize("listing", ["404", "empty", "error-object"])
+@pytest.mark.parametrize("layout", ["partial/train", "partial-train", "train"])
+def test_download_falls_back_to_the_parquet_export_tree(tmp_path, monkeypatch, listing, layout) -> None:
+    """When the /parquet listing has no files, the split's files come from the refs/convert/parquet tree, in
+    shard order across pages, whichever folder layout the export uses; other splits and files are ignored."""
+    import urllib.error
+
+    tree = "https://huggingface.co/api/datasets/org/ds/tree/refs%2Fconvert%2Fparquet/Py-all?recursive=true"
+    page2 = tree + "&cursor=abc"
+    first = [{"type": "directory", "path": f"Py-all/{layout}"},
+             {"type": "file", "path": f"Py-all/{layout}/0001.parquet", "size": 3},
+             {"type": "file", "path": "Py-all/partial-test/0000.parquet", "size": 3},
+             {"type": "file", "path": f"Py-all/{layout}/README.md", "size": 3}]
+    second = [{"type": "file", "path": f"Py-all/{layout}/0000.parquet", "size": 3}, "not-an-entry"]
+    requested: list[str] = []
+
+    def fake_urlopen(request, timeout=0):
+        url = request.full_url
+        requested.append(url)
+        if url.endswith("/parquet/Py-all/train"):
+            if listing == "404":
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return _Response(b"[]" if listing == "empty" else b'{"error": "not ready"}')
+        if url == tree:
+            return _Paged(json.dumps(first).encode(), f'<{page2}>; rel="next"')
+        if url == page2:
+            return _Paged(json.dumps(second).encode())
+        return _Response(b"PAR1" + url.encode())
+
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", fake_urlopen)
+    paths = download_hf_parquet("org/ds", "Py-all", tmp_path)
+    resolve = "https://huggingface.co/datasets/org/ds/resolve/refs%2Fconvert%2Fparquet/Py-all/"
+    expected = [resolve + f"{layout}/0000.parquet", resolve + f"{layout}/0001.parquet"]
+    assert requested[1:3] == [tree, page2]
+    assert requested[3:] == expected
+    assert [p.read_bytes() for p in paths] == [b"PAR1" + url.encode() for url in expected]
+    assert corpus_module.parquet_tree_urls("org/ds", "Py-all") == expected
+
+
+def test_parquet_tree_urls_of_an_unknown_dataset_is_empty(monkeypatch) -> None:
+    import urllib.error
+
+    def not_found(request, timeout=0):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(corpus_module.urllib.request, "urlopen", not_found)
+    assert corpus_module.parquet_tree_urls("org/missing", "cfg") == []

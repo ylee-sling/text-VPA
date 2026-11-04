@@ -22,11 +22,14 @@ actions to discrete tokens.
 > [!IMPORTANT]
 > **A research prototype with equation-level verification. No trained checkpoints and no benchmark results
 > yet.** The paper's evaluation protocol (Sec. 5) has not been run. What is verified:
-> - 1,116 unit and integration tests check every equation against independent float64 references, the
+> - 1,126 unit and integration tests check every equation against independent float64 references, the
 >   K + 3 depth, Proposition 4(d), and the Stage-2 anti-leakage invariant;
 > - the Pass@k harness passes every HumanEval reference solution (164/164) and 499/500 of MBPP's test split;
 > - `scripts/gcp/train_l4.sh` (corpus → Stage 1 → Stage 2 → Pass@k) runs end to end and resumes after an
 >   interruption (checked on CPU with tiny settings; not yet run on an L4);
+> - `scripts/gcp/run_all.sh` also runs end to end on a simulated reused VM (checked on CPU): a tmux server that
+>   passes another project's `PYTHONPATH`, pip index, `PIP_USER`, uv settings and `CUDA_VISIBLE_DEVICES` on,
+>   no system Python 3.12, and a broken `.venv`;
 > - the numerical checks of Sec. 4.6 reproduce Table 2 exactly (`python -m text_vpa.utils.verification`);
 > - the roofline model reproduces every cell of Table 3 (`python -m text_vpa.utils.profiler --roofline`);
 > - the full pipeline (Stage 1 → Stage 2 → Algorithm 1) runs end to end on CPU and with two-process DDP, and
@@ -243,6 +246,48 @@ VM's clock (UTC). Settings are environment variables, such as `STAGE2_STEPS=3000
 Step by step instead: `bash scripts/gcp/setup_vm.sh`, then
 `tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'`.
 
+### Reusing a VM from another project
+
+A VM that already hosts other software, environments or running work can break the run in ways a fresh one
+cannot. Check it first: `scripts/gcp/preflight.sh` is read-only (it installs, starts and changes nothing) and
+exits with status 1 if something would stop the run.
+
+```bash
+cd ~ && if [ -d text-VPA/.git ]; then git -C text-VPA pull --ff-only; else git clone https://github.com/ylee-sling/text-VPA.git; fi && bash text-VPA/scripts/gcp/preflight.sh
+```
+
+| Area | Checked | FAIL when |
+|---|---|---|
+| System | OS, vCPUs, memory; passwordless sudo; free disk | no sudo; less than `MIN_FREE_GB` (60) GB free |
+| GPU | `nvidia-smi`, GPU model and memory, driver → PyTorch build | no working driver; a driver older than 525 |
+| Other work | processes on the GPU; tmux and screen sessions, containers and CPU load that the final shutdown would stop | the GPU is in use (`ALLOW_BUSY_GPU=1` makes it a warning) |
+| Python | a Python ≥ 3.12 for `.venv`; an existing `.venv` | `PYTHON` names a Python older than 3.12 |
+| Settings | `PYTHONPATH`, `LD_LIBRARY_PATH`, conda, `PIP_*` and pip.conf files, a running tmux server's environment, `CUDA_VISIBLE_DEVICES` | — (reported) |
+| text-VPA | the clone (local changes, behind GitHub); an earlier run, corpus and checkpoints | — (reported) |
+| Network | GitHub, PyPI, the PyTorch wheel index (drivers < 580), HumanEval and MBPP, the corpus files on Hugging Face | a host the run needs is unreachable |
+
+Then start the run with the check in front, so that it starts only if the check passes:
+
+```bash
+cd ~ && if [ -d text-VPA/.git ]; then git -C text-VPA pull --ff-only; else git clone https://github.com/ylee-sling/text-VPA.git; fi && bash text-VPA/scripts/gcp/preflight.sh && bash text-VPA/scripts/gcp/run_all.sh
+```
+
+What `run_all.sh` does differently on such a VM:
+- **Python.** It always builds its own `.venv`, and recreates one that is broken or older than Python 3.12.
+  Without a system Python ≥ 3.12 (e.g. Ubuntu 22.04), it installs a standalone Python 3.12 with
+  [uv](https://docs.astral.sh/uv/) into `.python/`; nothing outside the repository changes. `PYTHON=/path/to/python3.12`
+  picks an interpreter, `PYTHON=uv` forces the standalone one.
+- **Inherited settings.** It clears `PYTHONPATH`, `PYTHONHOME`, `LD_LIBRARY_PATH`, `LD_PRELOAD`, conda and venv
+  variables, and the `PIP_*` variables except pip's network ones (`PIP_CERT`, `PIP_CLIENT_CERT`, `PIP_PROXY`,
+  `PIP_TRUSTED_HOST`), and ignores pip.conf files. A tmux server started earlier passes its own environment to new
+  sessions, so this matters even when your shell is clean. The run gets the launching shell's
+  `CUDA_VISIBLE_DEVICES`. `KEEP_ENV=1` turns the cleanup off.
+- **PyTorch.** PyTorch 2.14 is built for CUDA 13.0 (the PyPI wheel; NVIDIA driver 580 or newer) and CUDA 12.6
+  (driver 525 or newer). With a driver from 525 to 579 the run installs the CUDA 12.6 build;
+  `TORCH_INDEX_URL` overrides the choice.
+- **Shutdown.** The VM still shuts down when the run ends, which stops anything else running on it. To keep other
+  work alive, start with `SHUTDOWN_ON_SUCCESS=0 SHUTDOWN_ON_FAILURE=0 bash text-VPA/scripts/gcp/run_all.sh`.
+
 `train_l4.sh` runs these steps in order:
 1. download and build the corpus;
 2. check memory on worst-case batches;
@@ -350,7 +395,7 @@ text-VPA/
 │   └── utils/              verification (App. B), profiler (Sec. 5.4), memory_probe, device
 ├── tests/                  equation-level tests, theory verification, end-to-end
 ├── train.py  generate.py  evaluate.py   CLIs
-├── scripts/                init_repo.sh, release.sh; gcp/ (create_vm, setup_vm, train_l4)
+├── scripts/                init_repo.sh, release.sh; gcp/ (create_vm, setup_vm, train_l4, run_all, preflight)
 └── docs/pr_jepa_preprint.pdf
 ```
 

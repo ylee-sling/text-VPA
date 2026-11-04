@@ -1,6 +1,7 @@
-# Virtual environments (recreate with requirements*.txt)
+# Virtual environments (recreate with requirements*.txt); the standalone Python of scripts/gcp/run_all.sh
 .venv/
 venv/
+/.python/
 
 # Python bytecode and packaging
 __pycache__/
