@@ -51,7 +51,7 @@ import keyword
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AdmissibilityViolation",
+    "license_context_words",
     "ArityEnergy",
     "ConstraintEnergyEvaluator",
     "EnergyResult",
@@ -289,6 +290,33 @@ class VocabularyAnalysis:
             for variant in (word, " " + word, "." + word, "(" + word):
                 out.update(int(i) for i in tokenizer.encode(variant) if self.word_bearing[int(i)])
         return out
+
+
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def license_context_words(plans: Sequence[PlanConstraints], contexts: Sequence[str], tokenizer: TextVPATokenizer,
+                          analysis: VocabularyAnalysis) -> list[PlanConstraints]:
+    """The plans with the words of their context c also licensed (``sampler.license_context``).
+
+    The context names the function to write, its parameters and imports, and holds the docstring the target
+    repeats; ``PlanVocabularyEnergy`` would otherwise forbid every one of those tokens the readout's inventory
+    misses. The licensed set then depends on c and Z only, never on the draft, so the term stays plan-mediated
+    and Prop. 4(d) holds. Licensed: each identifier-like word of c in the tokenizations of
+    ``licensed_ids_for_words``, and the identifier-bearing tokens of c's own tokenization. A plan without a
+    vocabulary constraint (``licensed_tokens is None``) is returned unchanged.
+    """
+    if len(plans) != len(contexts):
+        raise ValueError(f"{len(plans)} plans for {len(contexts)} contexts")
+    out = []
+    for plan, text in zip(plans, contexts, strict=True):
+        if plan.licensed_tokens is None:
+            out.append(plan)
+            continue
+        ids = analysis.licensed_ids_for_words(tokenizer, set(_WORD.findall(text)))
+        ids.update(int(i) for i in tokenizer.encode(text) if analysis.word_bearing[int(i)])
+        out.append(replace(plan, licensed_tokens=plan.licensed_tokens | frozenset(ids)))
+    return out
 
 
 # =============================================================================================

@@ -38,6 +38,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--guidance", type=float, default=None, help="predictor-free guidance scale omega")
     p.add_argument("--mode-strategy", choices=("sample", "greedy", "gumbel"), default=None)
     p.add_argument("--no-energy", action="store_true", help="disable the constraint energies and the repair")
+    p.add_argument("--license-context", action="store_true",
+                   help="also license the context's words in the plan-vocabulary energy (sampler.license_context)")
+    p.add_argument("--inventory-threshold", type=float, default=None,
+                   help="readout inventory threshold for licensed tokens (default: the checkpoint's)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto")
     return p.parse_args(argv)
@@ -56,10 +60,17 @@ def main(argv: list[str] | None = None) -> int:
                                  ("guidance_scale", args.guidance)) if v is not None}
     realizer_cfg = RealizerConfig.model_validate({**cfg.realizer.model_dump(), **rupdate})
     sampler_cfg = cfg.sampler
-    if args.mode_strategy is not None:
-        sampler_cfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), "mode_strategy": args.mode_strategy})
+    supdate = {k: v for k, v in (("mode_strategy", args.mode_strategy),
+                                 ("license_context", True if args.license_context else None)) if v is not None}
+    if supdate:
+        sampler_cfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), **supdate})
     sampler = build_sampler(loaded, use_energy=not args.no_energy)
     sampler.rcfg, sampler.scfg = realizer_cfg, sampler_cfg
+    if args.inventory_threshold is not None:
+        if not 0.0 < args.inventory_threshold < 1.0:
+            print("error: --inventory-threshold must be in (0, 1)", file=sys.stderr)
+            return 2
+        sampler.inventory_threshold = args.inventory_threshold
     k_steps = args.k_steps or realizer_cfg.num_steps
     if k_steps not in realizer_cfg.step_budgets:
         print(f"warning: K = {k_steps} is not a trained step budget {list(realizer_cfg.step_budgets)}; "

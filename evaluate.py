@@ -55,6 +55,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mode-strategy", choices=("sample", "greedy", "gumbel"), default=None)
     p.add_argument("--temperature", type=float, default=None, help="energy temperature T")
     p.add_argument("--no-energy", action="store_true", help="disable the constraint energies and the repair")
+    p.add_argument("--license-context", action="store_true",
+                   help="also license the context's words in the plan-vocabulary energy (sampler.license_context)")
+    p.add_argument("--inventory-threshold", type=float, default=None,
+                   help="readout inventory threshold for licensed tokens (default: the checkpoint's)")
     p.add_argument("--limit", type=int, default=None, help="evaluate the first N problems only")
     p.add_argument("--timeout", type=float, default=10.0, help="seconds per test program")
     p.add_argument("--exec-workers", type=int, default=4, help="test programs run in parallel")
@@ -78,8 +82,14 @@ def generate(args: argparse.Namespace, tasks: list[EvalTask]) -> tuple[list[list
         rcfg = RealizerConfig.model_validate({**rcfg.model_dump(), "temperature": args.temperature})
     sampler = build_sampler(loaded, use_energy=not args.no_energy)
     sampler.rcfg = rcfg
-    if args.mode_strategy:
-        sampler.scfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), "mode_strategy": args.mode_strategy})
+    supdate = {k: v for k, v in (("mode_strategy", args.mode_strategy),
+                                 ("license_context", True if args.license_context else None)) if v is not None}
+    if supdate:
+        sampler.scfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), **supdate})
+    if args.inventory_threshold is not None:
+        if not 0.0 < args.inventory_threshold < 1.0:
+            raise SystemExit("--inventory-threshold must be in (0, 1)")
+        sampler.inventory_threshold = args.inventory_threshold
     k_steps = args.k_steps or rcfg.num_steps
     tok = loaded.tokenizer
     samples: list[list[str]] = []
@@ -108,7 +118,8 @@ def generate(args: argparse.Namespace, tasks: list[EvalTask]) -> tuple[list[list
             print(f"  generated {t_index + 1}/{len(tasks)} problems", file=sys.stderr)
     info = {"checkpoint": str(args.checkpoint), "stage": loaded.stage, "step": loaded.step,
             "realizer": rcfg.kind, "k_steps": k_steps, "sequential_depth": depth, "device": str(device),
-            "energy": not args.no_energy, "generation_seconds": round(seconds, 3),
+            "energy": not args.no_energy, "license_context": sampler.scfg.license_context,
+            "inventory_threshold": sampler.inventory_threshold, "generation_seconds": round(seconds, 3),
             "seconds_per_problem": round(seconds / max(len(tasks), 1), 4), **stats}
     return samples, info
 

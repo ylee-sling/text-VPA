@@ -1384,3 +1384,23 @@ def test_repair_keeps_an_admissible_reference(bpe_tok: TextVPATokenizer, extract
     ids = torch.tensor([bpe_tok.encode(PROGRAM_TREE) + [bpe_tok.pad_id] * 3])
     out, unrepaired = ev.repair(ids, torch.rand(*ids.shape, bpe_tok.vocab_size), [plan], source_token=bpe_tok.mask_id)
     assert torch.equal(out, ids) and unrepaired == 0
+
+
+def test_license_context_words_adds_the_context_vocabulary(bpe_tok) -> None:
+    from text_vpa.inference.energy_terms import license_context_words
+
+    analysis = VocabularyAnalysis(bpe_tok, "python")
+    context = 'def total(values: list) -> int:\n    """Sum of values."""\n'
+    plan = PlanConstraints(licensed_tokens=frozenset())
+    (out,) = license_context_words([plan], [context], bpe_tok, analysis)
+    assert out.licensed_tokens is not None
+    own = {int(i) for i in bpe_tok.encode(context) if analysis.word_bearing[int(i)]}
+    assert own and own <= out.licensed_tokens                              # c's own tokenization
+    for word in ("total", "values", "list", "int", "Sum", "of"):          # each word in the usual contexts
+        for variant in (word, " " + word, "." + word, "(" + word):
+            assert {int(i) for i in bpe_tok.encode(variant) if analysis.word_bearing[int(i)]} <= out.licensed_tokens
+    assert all(analysis.word_bearing[i] for i in out.licensed_tokens)      # only identifier-bearing tokens
+    unconstrained = PlanConstraints(licensed_tokens=None)
+    assert license_context_words([unconstrained], [context], bpe_tok, analysis) == [unconstrained]
+    with pytest.raises(ValueError):
+        license_context_words([plan, plan], [context], bpe_tok, analysis)

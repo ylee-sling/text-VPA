@@ -747,6 +747,31 @@ def test_readout_plans_drive_the_energies_unless_plan_source_is_none(tiny_config
         PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(), energy, extractor, plan_source="reference")
 
 
+def test_license_context_adds_the_context_words_to_the_decoded_plans(tiny_config) -> None:
+    """sampler.license_context: the decoded plans license exactly the context's identifier-bearing tokens on top
+    of the readout's inventory; the output respects them (no hard violation) and Prop. 4(d) still holds
+    (check_admissibility is on, and the term reads c and Z only)."""
+    cfg = _config(tiny_config)
+    model = _model(cfg, open_gates=True)
+    energy = _evaluator(grammar=False, forbid_strings=False)
+    extractor = TreeSitterASTExtractor("python")
+    row = list(b"def f(xs_q):")[:M_C]
+    context = torch.tensor([row + [ord(" ")] * (M_C - len(row))] * B)
+    words = {t for t in row if _word_bearing(t)}
+    plain = PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(), energy, extractor).sample(
+        context, length=N, num_steps=2, generator=_gen(16))
+    licensed = PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(license_context=True), energy,
+                             extractor).sample(context, length=N, num_steps=2, generator=_gen(16))
+    assert plain.plans is not None and licensed.plans is not None
+    for before, after in zip(plain.plans, licensed.plans, strict=True):
+        assert before.licensed_tokens is not None and after.licensed_tokens is not None
+        assert after.licensed_tokens == before.licensed_tokens | words
+    assert any(not words <= p.licensed_tokens for p in plain.plans)      # the option changed the plans
+    assert licensed.hard_violations == 0
+    for out, plan in zip(licensed.tokens.tolist(), licensed.plans, strict=True):
+        assert all(not _word_bearing(t) or t in plan.licensed_tokens for t in _output(out))
+
+
 def test_mode_selection_greedy_forced_and_gumbel(tiny_config) -> None:
     cfg = _config(tiny_config)
     model = _model(cfg, open_gates=True)

@@ -372,6 +372,8 @@ class SamplerConfig(_Section):
     audit_depth: bool = Field(True, description="Runtime assertion that a generation costs exactly K + 3 passes.")
     repair_aware: bool = False
     default_length: int | None = Field(None, ge=1, description="Canvas length N; None: the readout's length head.")
+    license_context: bool = Field(False, description="Also license the words of the context c in the plan-vocabulary "
+                                                     "energy (draft-independent, so Prop. 4(d) holds).")
 
 
 # ---------------------------------------------------------------------------------------------

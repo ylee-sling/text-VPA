@@ -273,6 +273,19 @@ def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
                               "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--num-samples", "2",
                               "--k", "1", "--k-steps", "2", "--device", "cpu",
                               "--out", str(run / "eval" / "humaneval")]) == 0
+    summary = json.loads((run / "eval" / "humaneval" / "summary.json").read_text())
+    assert summary["license_context"] is False and summary["inventory_threshold"] == 0.5     # the defaults
+    assert evaluate_cli.main(["--benchmark", "humaneval", "--data", str(data / "eval" / "HumanEval.jsonl.gz"),
+                              "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--num-samples", "1",
+                              "--k", "1", "--k-steps", "2", "--device", "cpu", "--limit", "1",
+                              "--license-context", "--inventory-threshold", "0.3",
+                              "--out", str(tmp_path / "eval-licensed")]) == 0
+    licensed = json.loads((tmp_path / "eval-licensed" / "summary.json").read_text())
+    assert licensed["license_context"] is True and licensed["inventory_threshold"] == 0.3
+    with pytest.raises(SystemExit):
+        evaluate_cli.main(["--benchmark", "humaneval", "--data", str(data / "eval" / "HumanEval.jsonl.gz"),
+                           "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--inventory-threshold", "1.5",
+                           "--device", "cpu", "--out", str(tmp_path / "bad")])
     (data / "corpus").mkdir()
     records = synthetic_corpus(12, seed=3)
     for name, part in (("train-00000.jsonl.gz", records[:8]), ("val.jsonl.gz", records[8:])):
@@ -286,6 +299,7 @@ def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
     assert f"best_stage2.pt holds step {best}" in out and "minimum" in out
     assert "4 completions:" in out and "the prompt asks for add()" in out
     assert out.count("as evaluated") >= 3 and "validation contexts (unseen): 3 examples, K = 2" in out
+    assert out.count("context licensed") >= 2 and "plan-vocabulary energy: the readout licenses" in out
     assert "== Reading" in out
 
 

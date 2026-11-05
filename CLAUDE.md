@@ -87,7 +87,10 @@ python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference -
   (supervision, never conditioning). Energies use its decoded plan at inference, or the oracle
   `PlanConstraints.from_reference` for evaluation.
 - **Energies.** `PlanVocabularyEnergy` licenses identifier-bearing *tokens* (plan inventory + keywords +
-  builtins), plan-mediated and hard. `GrammarEnergy` (bracket legality outside strings/comments, incl. PEP 701
+  builtins), plan-mediated and hard. `sampler.license_context` (off by default; `--license-context` in
+  `evaluate.py` / `generate.py`) also licenses the words of the context c: c is fixed during realization,
+  so the term stays draft-independent and Prop. 4(d) holds. `--inventory-threshold` overrides
+  `readout.inventory_threshold` (0.5). `GrammarEnergy` (bracket legality outside strings/comments, incl. PEP 701
   f-strings; [PAD] inside an open bracket or string) is hard and draft-dependent. `ArityEnergy` and
   `TypeSignatureEnergy` are soft (5.0) and draft-dependent. The final repair is network-free: left to right
   with the energies of the repaired prefix, it replaces hard violations, leftover [MASK]s and positions that

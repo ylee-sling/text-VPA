@@ -307,6 +307,11 @@ python evaluate.py --benchmark humaneval --data data/eval/HumanEval.jsonl.gz \
 python evaluate.py --benchmark mbpp --data data/eval/mbpp.jsonl --reference --out runs/eval/mbpp-reference
 ```
 
+`--no-energy` turns the constraint energies off. `--license-context` also licenses the context's words in
+the plan-vocabulary energy, and `--inventory-threshold` sets the readout's licensing threshold (default
+0.5). Without `--license-context`, only the readout's predicted token inventory, keywords and builtins are
+licensed, so the prompt's own names and docstring words can be forbidden.
+
 After a run, `python -m text_vpa.evaluation.diagnose` reports which checkpoint was scored (every Stage-2
 validation loss and the step in `best_stage2.pt`), prints HumanEval completions with their errors, and
 generates from training and validation contexts with and without the energies and with the reference

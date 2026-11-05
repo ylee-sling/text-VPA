@@ -41,7 +41,7 @@ from torch import Tensor
 from text_vpa.configs.schema import PLANNER_PASSES, RealizerConfig, SamplerConfig
 from text_vpa.data.ast_parser import TreeSitterASTExtractor
 from text_vpa.data.tokenization import TextVPATokenizer
-from text_vpa.inference.energy_terms import ConstraintEnergyEvaluator, PlanConstraints
+from text_vpa.inference.energy_terms import ConstraintEnergyEvaluator, PlanConstraints, license_context_words
 from text_vpa.models.realizers.kernels import repair_aware_multiplier, sample_jump, tilted_jump_kernel
 from text_vpa.models.realizers.logit_kl import LogitKLRealizer
 from text_vpa.models.realizers.paths import KappaSchedule, uniform_time_grid
@@ -201,6 +201,11 @@ class PRJEPASampler:
                     if decode_plans:
                         plans, lengths = model.readout.decode(readout_out, self.tokenizer, self.extractor,
                                                               self.energy.analysis, self.inventory_threshold)
+                        if self.scfg.license_context:
+                            rows = context.tolist() if context_mask is None else [
+                                row[mask].tolist() for row, mask in zip(context, context_mask.bool(), strict=True)]
+                            plans = license_context_words(plans, [self.tokenizer.decode(r) for r in rows],
+                                                          self.tokenizer, self.energy.analysis)
                     else:
                         lengths = (readout_out.length_logits.argmax(-1) + 1) * model.readout.length_bucket_size
                 guidance = self.rcfg.guidance_scale > 0

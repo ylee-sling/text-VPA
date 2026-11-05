@@ -29,9 +29,11 @@ from pathlib import Path
 
 import torch
 
+from text_vpa.configs.schema import SamplerConfig
 from text_vpa.data.dataset import load_jsonl
 from text_vpa.data.synthetic import CodeRecord
 from text_vpa.evaluation.tasks import load_humaneval_tasks
+from text_vpa.inference.energy_terms import PlanVocabularyEnergy, license_context_words
 from text_vpa.inference.loading import build_sampler, load_model
 from text_vpa.utils.device import resolve_device
 
@@ -149,7 +151,14 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
     loaded = load_model(run / "stage2" / "best_stage2.pt", device)
     tok, cfg = loaded.tokenizer, loaded.cfg
     samplers = {"as evaluated": build_sampler(loaded, use_energy=True),
-                "no energies": build_sampler(loaded, use_energy=False)}
+                "no energies": build_sampler(loaded, use_energy=False),
+                "context licensed": build_sampler(loaded, use_energy=True)}
+    samplers["context licensed"].scfg = SamplerConfig.model_validate(
+        {**cfg.sampler.model_dump(), "license_context": True})
+    energy = samplers["as evaluated"].energy
+    analysis = energy.analysis if energy is not None else None
+    base = frozenset().union(*(t.base_licensed for t in energy.terms if isinstance(t, PlanVocabularyEnergy))) \
+        if energy is not None else frozenset()
     k = k_steps or cfg.realizer.num_steps
     train_files = sorted(glob.glob(str(data / "corpus" / "train-*.jsonl.gz")))
     val_file = data / "corpus" / "val.jsonl.gz"
@@ -165,7 +174,8 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
             print(f"  {split}: none found")
             continue
         picked = rng.sample(records, min(examples, len(records)))
-        scores = {name: Score() for name in ("as evaluated", "no energies", "reference length")}
+        scores = {name: Score() for name in ("as evaluated", "no energies", "reference length", "context licensed")}
+        licensed_size = covered = covered_with_context = 0.0
         for i, record in enumerate(picked):
             ids = tok.encode(record.context)[: cfg.data.max_context_tokens] or [tok.pad_id]
             context = torch.tensor([ids], device=device)
@@ -182,12 +192,30 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
                           abs(int(result.tokens.shape[1]) - reference_n))
                 if example is None and name == "as evaluated":
                     example = (record, text)
+                plan = result.plans[0] if result.plans else None
+                if name == "as evaluated" and analysis is not None and plan is not None \
+                        and plan.licensed_tokens is not None:
+                    # How much of the reference's own vocabulary the plan-vocabulary energy lets through.
+                    reference_words = {int(t) for t in tok.encode(record.target) if analysis.word_bearing[int(t)]}
+                    licensed = plan.licensed_tokens | base
+                    with_context = license_context_words([plan], [record.context], tok, analysis)[0]
+                    licensed_size += len(plan.licensed_tokens)
+                    covered += len(reference_words & licensed) / max(len(reference_words), 1)
+                    assert with_context.licensed_tokens is not None
+                    covered_with_context += (len(reference_words & (with_context.licensed_tokens | base))
+                                             / max(len(reference_words), 1))
         print(f"  {split}: {len(picked)} examples, K = {k}")
         for name, score in scores.items():
             print(f"    {name:<17} {score.line()}")
+        n = max(len(picked), 1)
+        if analysis is not None:
+            print(f"    plan-vocabulary energy: the readout licenses {licensed_size / n:.0f} tokens per plan (plus "
+                  f"{len(base)} keyword/builtin tokens); they cover {covered / n:.0%} of the reference's word "
+                  f"tokens, {covered_with_context / n:.0%} with the context's words licensed")
         verdict[split] = scores["as evaluated"]
         verdict[split + " / reference length"] = scores["reference length"]
         verdict[split + " / no energies"] = scores["no energies"]
+        verdict[split + " / context licensed"] = scores["context licensed"]
     if example is not None:
         record, text = example
         print("\n  one training example, as evaluated -- reference (left) | generated (right):")
@@ -208,15 +236,23 @@ def reading(verdict: dict[str, Score]) -> None:
     reproduces = train.fraction("syntax") >= 0.5 and train.fraction("similarity") >= 0.6
     ref = verdict.get("training contexts (seen in Stage 2) / reference length")
     off = verdict.get("training contexts (seen in Stage 2) / no energies")
+    ctx = verdict.get("training contexts (seen in Stage 2) / context licensed")
+
+    def better(alt: Score | None) -> bool:
+        return alt is not None and (alt.fraction("syntax") >= train.fraction("syntax") + 0.2
+                                    or alt.fraction("similarity") >= train.fraction("similarity") + 0.2)
+
     if reproduces:
         print("  It reproduces its training targets but not unseen programs: it memorized the corpus and does")
         print("  not generalize. The remedy is more training data (and a model sized to it), not decoding settings.")
     elif ref is not None and ref.fraction("similarity") >= train.fraction("similarity") + 0.2:
         print("  It fails on its own training contexts, but much less with the reference canvas length: the")
         print("  readout's length head is the first suspect.")
-    elif off is not None and off.fraction("syntax") >= train.fraction("syntax") + 0.2:
-        print("  It fails on its own training contexts, but parses much better without the energies: the energies")
-        print("  or the repair are the first suspect.")
+    elif better(off) or better(ctx):
+        which = "with the context's words licensed" if better(ctx) else "without the energies"
+        print(f"  It fails on its own training contexts as evaluated, but does much better {which}: the")
+        print("  plan-vocabulary energy (the readout's inventory) forbids the tokens it needs. Evaluate with")
+        print("  --license-context (or --no-energy) before concluding anything about the realizer.")
     else:
         print("  It fails even on contexts it trained on, with any length and with or without the energies:")
         print("  the sampling path does not match training (or Stage 2 never learned to realize); investigate")
