@@ -13,7 +13,9 @@ Pipeline
     extraction     every top-level function with a docstring and a real body that is self-contained: each name
                    it reads is a parameter, a local, a builtin or a module-level import (the imports it needs
                    are kept). Context = needed imports + signature + docstring (HumanEval's prompt format);
-                   target = needed imports + the whole function (HumanEval's prompt + solution format)
+                   target = needed imports + the whole function (HumanEval's prompt + solution format).
+                   Optionally (``--include-methods``, ``--allow-undocumented``) also methods of top-level
+                   classes, moved to column 0, and undocumented functions (context = imports + signature)
     deduplication  exact, on the function's AST without its docstring (formatting and comments ignored)
     decontamination drop every function sharing a 13-word n-gram (identifiers and numbers; punctuation and
                    formatting ignored, as in GPT-3's 13-gram rule) with an evaluation problem (prompt,
@@ -27,6 +29,8 @@ CLI::
 
     python -m text_vpa.data.corpus download --dataset codeparrot/github-code-clean --config Python-all \\
         --out data/raw --max-files 4
+    python -m text_vpa.data.corpus download-shards --dataset codeparrot/github-code-clean --out data/shards
+        # all 880 shards (314 GB, every language), filtered to permissive Python while downloading
     python -m text_vpa.data.corpus build --source 'parquet:data/raw/*.parquet' \\
         --humaneval data/eval/HumanEval.jsonl.gz --mbpp data/eval/mbpp.jsonl --out data/corpus --workers 16
 """
@@ -66,10 +70,14 @@ __all__ = [
     "SourceFile",
     "build_corpus",
     "download_hf_parquet",
+    "download_hf_shards",
     "evaluation_texts",
+    "filter_parquet_rows",
+    "hf_repo_files",
     "extract_functions",
     "is_permissive",
     "iter_sources",
+    "parse_shard_selection",
     "parquet_tree_urls",
 ]
 
@@ -126,7 +134,12 @@ def _row_to_source(row: dict, fallback_origin: str) -> SourceFile | None:
     content = _pick(row, CONTENT_FIELDS)
     if not isinstance(content, str):
         return None
-    origin = _pick(row, ORIGIN_FIELDS)
+    origin = None
+    for repo, path in (("repo_name", "path"), ("max_stars_repo_name", "max_stars_repo_path")):
+        if row.get(repo) and row.get(path):                    # "owner/repo/dir/file.py": unique across repositories
+            origin = f"{row[repo]}/{row[path]}"
+            break
+    origin = origin or _pick(row, ORIGIN_FIELDS)
     return SourceFile(content, _normalise_license(_pick(row, LICENSE_FIELDS)), str(origin or fallback_origin))
 
 
@@ -236,28 +249,33 @@ def parquet_tree_urls(dataset: str, config: str, split: str = "train", headers: 
     """
     headers = dict(headers or {"User-Agent": "text-vpa-corpus/1"})
     folders = {f"{config}/{split}", f"{config}/partial-{split}", f"{config}/partial/{split}"}
-    url: str | None = (f"https://huggingface.co/api/datasets/{dataset}/tree/{_PARQUET_REVISION}/"
-                       f"{urllib.parse.quote(config)}?recursive=true")
-    paths: list[str] = []
+    url = (f"https://huggingface.co/api/datasets/{dataset}/tree/{_PARQUET_REVISION}/"
+           f"{urllib.parse.quote(config)}?recursive=true")
+    paths = [str(entry["path"]) for entry in _tree_entries(url, headers, attempts, base_delay, max_pages)
+             if str(entry["path"]).endswith(".parquet") and str(entry["path"]).rsplit("/", 1)[0] in folders]
+    return [f"https://huggingface.co/datasets/{dataset}/resolve/{_PARQUET_REVISION}/{urllib.parse.quote(p)}"
+            for p in sorted(paths)]
+
+
+def _tree_entries(url: str, headers: dict[str, str], attempts: int, base_delay: float,
+                  max_pages: int) -> list[dict]:
+    """File entries (``{"type": "file", "path", "size", ...}``) of a paginated Hub tree listing; [] on 404."""
+    files: list[dict] = []
+    next_url: str | None = url
     for _ in range(max_pages):
-        if url is None:
+        if next_url is None:
             break
-        page_url = url
+        page_url = next_url
         try:
-            entries, url = _retry(lambda page_url=page_url: _get_json(page_url, headers), f"tree {page_url}",
-                                  attempts, base_delay)
+            entries, next_url = _retry(lambda page_url=page_url: _get_json(page_url, headers), f"tree {page_url}",
+                                       attempts, base_delay)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return []
             raise
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            path = str(entry.get("path", ""))
-            if entry.get("type") == "file" and path.endswith(".parquet") and path.rsplit("/", 1)[0] in folders:
-                paths.append(path)
-    return [f"https://huggingface.co/datasets/{dataset}/resolve/{_PARQUET_REVISION}/{urllib.parse.quote(p)}"
-            for p in sorted(paths)]
+        files += [e for e in (entries if isinstance(entries, list) else [])
+                  if isinstance(e, dict) and e.get("type") == "file" and e.get("path")]
+    return files
 
 
 def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: str = "train",
@@ -317,10 +335,260 @@ def download_hf_parquet(dataset: str, config: str, out_dir: str | Path, split: s
 
 
 # =============================================================================================
+# Raw shards: every file of a dataset repository, filtered while downloading
+# =============================================================================================
+class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib's redirects, without the Authorization header once a redirect leaves the host: the Hub sends file
+    downloads to a CDN with a signed URL, which needs no token and should not receive it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201 - urllib signature
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            new.remove_header("Authorization")
+        return new
+
+
+def _open(request: urllib.request.Request, timeout: float):  # noqa: ANN201 - an http.client response
+    """``urlopen`` with ``_DropAuthOnRedirect``."""
+    return urllib.request.build_opener(_DropAuthOnRedirect).open(request, timeout=timeout)
+
+
+def _hub_headers(token: str | None) -> dict[str, str]:
+    token = token or os.environ.get("HF_TOKEN")
+    headers = {"User-Agent": "text-vpa-corpus/1"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _endpoint(endpoint: str | None) -> str:
+    return (endpoint or os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
+
+
+def hf_repo_files(dataset: str, folder: str = "", revision: str = "main", token: str | None = None,
+                  endpoint: str | None = None, attempts: int = 6, base_delay: float = 5.0,
+                  max_pages: int = 1000) -> list[tuple[str, int | None]]:
+    """(path, size in bytes or None) of the files under ``folder`` of a Hub dataset repository, in path order."""
+    quoted = urllib.parse.quote(folder.strip("/"))
+    url = (f"{_endpoint(endpoint)}/api/datasets/{dataset}/tree/{urllib.parse.quote(revision, safe='')}"
+           f"{'/' + quoted if quoted else ''}?recursive=true")
+    files = []
+    for entry in _tree_entries(url, _hub_headers(token), attempts, base_delay, max_pages):
+        lfs = entry.get("lfs")
+        size = lfs.get("size") if isinstance(lfs, dict) and lfs.get("size") else entry.get("size")
+        files.append((str(entry["path"]), int(size) if size is not None else None))
+    return sorted(files)
+
+
+def parse_shard_selection(text: str | None, count: int) -> list[int]:
+    """Shard indices from ``"0-99,120,200-"`` (ranges inclusive, open end = the last shard); None = all."""
+    if not text:
+        return list(range(count))
+    chosen: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        start, dash, end = part.partition("-")
+        first = int(start) if start else 0
+        last = (int(end) if end else count - 1) if dash else first
+        if first < 0 or last >= count or first > last:
+            raise ValueError(f"shard selection {part!r} outside 0-{count - 1}")
+        chosen.update(range(first, last + 1))
+    return sorted(chosen)
+
+
+class SchemaError(ValueError):
+    """A Parquet file without the columns a filter needs (not retried, unlike a corrupt download)."""
+
+
+def filter_parquet_rows(src: str | Path, dest: str | Path, languages: frozenset[str] | None = frozenset({"Python"}),
+                        extensions: Sequence[str] = (".py",), licenses: frozenset[str] | None = PERMISSIVE_LICENSES,
+                        batch_rows: int = 4096) -> tuple[int, int]:
+    """Copy the rows of the Parquet file ``src`` in one of ``languages`` (the ``language`` column, or else a
+    ``path`` ending in one of ``extensions``) under a permissive license (``is_permissive`` of the ``license``
+    column) to ``dest`` (zstd), keeping the content, license and origin columns. Returns (rows read, rows kept).
+    ``None`` disables a filter."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    handle = pq.ParquetFile(src)
+    names = handle.schema_arrow.names
+    keep = list(dict.fromkeys(c for c in (*CONTENT_FIELDS, *LICENSE_FIELDS, *ORIGIN_FIELDS) if c in names))
+    if not any(c in names for c in CONTENT_FIELDS):
+        raise SchemaError(f"{src}: no content column among {CONTENT_FIELDS} (columns: {sorted(names)})")
+    if languages is not None and "language" not in names and "path" not in names:
+        raise SchemaError(f"{src}: neither a language nor a path column to select {sorted(languages)} by")
+    license_column = next((c for c in LICENSE_FIELDS if c in names), None)
+    if licenses is not None and license_column is None:
+        raise SchemaError(f"{src}: no license column among {LICENSE_FIELDS}")
+    read = sorted(set(keep) | ({"language"} & set(names)) | ({"path"} & set(names)))
+    verdicts: dict[Any, bool] = {}
+    rows = kept = 0
+    writer = None
+    try:
+        for batch in handle.iter_batches(batch_size=batch_rows, columns=read):
+            rows += batch.num_rows
+            mask = pa.array([True] * batch.num_rows)
+            if languages is not None:
+                if "language" in names:
+                    mask = pc.and_(mask, pc.fill_null(pc.is_in(batch.column("language"),
+                                                               value_set=pa.array(sorted(languages))), False))
+                else:
+                    by_ext = pa.array([False] * batch.num_rows)
+                    for ext in extensions:
+                        by_ext = pc.or_(by_ext, pc.fill_null(pc.ends_with(batch.column("path"), ext), False))
+                    mask = pc.and_(mask, by_ext)
+            if licenses is not None:                          # is_permissive per distinct value (a few)
+                allowed = []
+                for value in batch.column(license_column).to_pylist():
+                    key = repr(value)
+                    verdict = verdicts.get(key)
+                    if verdict is None:
+                        verdict = verdicts[key] = is_permissive(_normalise_license(value), licenses)
+                    allowed.append(verdict)
+                mask = pc.and_(mask, pa.array(allowed, type=pa.bool_()))
+            chosen = batch.filter(mask).select(keep)
+            if chosen.num_rows:
+                if writer is None:
+                    writer = pq.ParquetWriter(dest, chosen.schema, compression="zstd")
+                writer.write_batch(chosen)
+                kept += chosen.num_rows
+        if writer is None:                                    # nothing kept: an empty file with the schema
+            schema = pa.schema([handle.schema_arrow.field(c) for c in keep])
+            writer = pq.ParquetWriter(dest, schema, compression="zstd")
+    finally:
+        if writer is not None:
+            writer.close()
+    return rows, kept
+
+
+def download_hf_shards(dataset: str, out_dir: str | Path, folder: str = "data", revision: str = "main",
+                       pattern: str = "*.parquet", shards: str | None = None,
+                       languages: frozenset[str] | None = frozenset({"Python"}), extensions: Sequence[str] = (".py",),
+                       licenses: frozenset[str] | None = PERMISSIVE_LICENSES, workers: int = 8,
+                       token: str | None = None, endpoint: str | None = None, attempts: int = 6,
+                       base_delay: float = 5.0, keep_raw: bool = False) -> dict:
+    """Download the Parquet files of a Hub dataset repository (e.g. the 880 shards of github-code-clean, all
+    languages and licenses) and keep only the rows of ``filter_parquet_rows``: one small Parquet file per shard
+    in ``out_dir``, the raw shard deleted afterwards (``keep_raw`` keeps it in ``out_dir/raw``).
+
+    Resumable: a shard whose filtered file and ``.json`` record exist is not fetched again. ``workers`` shards
+    are processed at a time; each download is checked against Content-Length and retried with exponential
+    backoff, and a raw file that does not read as Parquet is fetched once more. Shards that still fail are
+    listed in ``out_dir/shards.json`` and raise RuntimeError after the others are done (rerun to retry them).
+    ``token`` (or ``HF_TOKEN``) is sent to the Hub, not to the CDN it redirects downloads to. Returns the
+    summary written to ``shards.json``.
+    """
+    import concurrent.futures
+    import fnmatch
+
+    out = Path(out_dir)
+    raw_dir = out / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    headers = _hub_headers(token)
+    base = _endpoint(endpoint)
+    files = [(p, s) for p, s in hf_repo_files(dataset, folder, revision, token, endpoint, attempts, base_delay)
+             if fnmatch.fnmatch(p.rsplit("/", 1)[-1], pattern)]
+    if not files:
+        raise ValueError(f"no file matches {pattern!r} under {folder!r} of {dataset} ({revision})")
+    selected = [files[i] for i in parse_shard_selection(shards, len(files))]
+    total_bytes = sum(s or 0 for _, s in selected)
+
+    def process(path: str, size: int | None) -> dict:
+        name = path.rsplit("/", 1)[-1].removesuffix(".parquet")
+        dest, record = out / f"{name}.parquet", out / f"{name}.json"
+        if dest.exists() and record.exists():
+            return json.loads(record.read_text()) | {"skipped": True}
+        started = time.time()
+        raw, part = raw_dir / f"{name}.parquet", raw_dir / f"{name}.parquet.part"
+        url = (f"{base}/datasets/{dataset}/resolve/{urllib.parse.quote(revision, safe='')}/"
+               f"{urllib.parse.quote(path)}")
+
+        def fetch() -> None:
+            request = urllib.request.Request(url, headers=headers)
+            with _open(request, timeout=600) as response, open(part, "wb") as handle:
+                header = getattr(response, "headers", None)
+                expected = header.get("Content-Length") if header is not None else None
+                written = 0
+                while chunk := response.read(1 << 22):
+                    handle.write(chunk)
+                    written += len(chunk)
+            if expected is not None and written != int(expected):
+                raise ValueError(f"truncated download: {written} of {expected} bytes")
+            if size is not None and written != size:
+                raise ValueError(f"size {written} differs from the listing's {size}")
+            part.replace(raw)
+
+        for trial in (1, 2):                                  # a corrupt file is fetched once more
+            if not raw.exists():
+                _retry(fetch, f"download {path}", attempts, base_delay)
+            try:
+                tmp = dest.with_name(dest.name + ".tmp")
+                rows, kept = filter_parquet_rows(raw, tmp, languages, extensions, licenses)
+                break
+            except SchemaError:
+                raise
+            except Exception as exc:                          # pyarrow raises ArrowInvalid / OSError
+                raw.unlink(missing_ok=True)
+                if trial == 2:
+                    raise RuntimeError(f"{path} does not read as Parquet: {exc}") from exc
+                logger.warning("%s does not read as Parquet (%s); downloading it again", path, exc)
+        result = {"source": path, "rows": rows, "kept": kept, "bytes": raw.stat().st_size,
+                  "seconds": round(time.time() - started, 1)}
+        record_tmp = record.with_name(record.name + ".tmp")
+        record_tmp.write_text(json.dumps(result))
+        record_tmp.replace(record)
+        tmp.replace(dest)
+        if not keep_raw:
+            raw.unlink(missing_ok=True)
+        return result
+
+    results: list[dict] = []
+    failed: dict[str, str] = {}
+    done_bytes = fetched_bytes = 0
+    start = time.time()
+    logger.info("%d shard(s) of %s (%.1f GB) -> %s, %d at a time", len(selected), dataset, total_bytes / 1e9,
+                out, workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(process, p, s): (p, s) for p, s in selected}
+        for future in concurrent.futures.as_completed(futures):
+            path, size = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:                          # reported after the other shards
+                failed[path] = str(exc)
+                logger.error("shard %s failed: %s", path, exc)
+                continue
+            results.append(result)
+            nbytes = size or result.get("bytes", 0)
+            done_bytes += nbytes
+            fetched_bytes += 0 if result.get("skipped") else nbytes
+            rate = fetched_bytes / max(time.time() - start, 1e-9)
+            eta = f"{(total_bytes - done_bytes) / rate / 60:.0f} min" if rate > 0 and total_bytes else "?"
+            logger.info("shard %d/%d %s: %d of %d rows kept%s; %.1f of %.1f GB, ETA %s", len(results),
+                        len(selected), path.rsplit("/", 1)[-1], result["kept"], result["rows"],
+                        " (done earlier)" if result.get("skipped") else "", done_bytes / 1e9, total_bytes / 1e9, eta)
+    summary = {"dataset": dataset, "revision": revision, "folder": folder, "selected": len(selected),
+               "completed": len(results), "rows": sum(r["rows"] for r in results),
+               "kept": sum(r["kept"] for r in results), "languages": sorted(languages) if languages else None,
+               "licenses": sorted(licenses) if licenses else None, "failed": failed}
+    (out / "shards.json").write_text(json.dumps(summary, indent=2))
+    if failed:
+        raise RuntimeError(f"{len(failed)} of {len(selected)} shard(s) failed (rerun to retry them): "
+                           f"{sorted(failed)[:5]}")
+    return summary
+
+
+# =============================================================================================
 # Extraction
 # =============================================================================================
 @dataclass(frozen=True)
 class CorpusLimits:
+    """What ``extract_functions`` keeps. The defaults keep self-contained, documented top-level functions
+    (HumanEval's format); ``include_methods`` and ``require_docstring=False`` widen the corpus (Run 2)."""
+
     max_file_chars: int = 1_000_000
     min_doc_chars: int = 20
     max_doc_chars: int = 2_000
@@ -329,6 +597,9 @@ class CorpusLimits:
     min_body_statements: int = 1
     max_non_ascii_fraction: float = 0.05
     skip_tests: bool = True
+    include_methods: bool = False               # also methods of top-level classes, dedented to column 0
+    require_docstring: bool = True              # False: undocumented functions too, with a signature-only context
+    min_undocumented_statements: int = 2        # body statements an undocumented function needs
 
 
 @dataclass(frozen=True)
@@ -339,6 +610,8 @@ class FunctionPair:
     key: str                     # dedup key: SHA-1 of the AST without the docstring
     origin: str = ""
     license: str | None = None
+    documented: bool = True
+    method: bool = False
 
 
 def _import_bindings(module: ast.Module) -> dict[str, tuple[str, str]]:
@@ -415,16 +688,29 @@ def _trivial_body(body: Sequence[ast.stmt]) -> bool:
     return False
 
 
+def _statement_count(body: Sequence[ast.stmt]) -> int:
+    """Statements in ``body``, nested ones included (``if x: return 1`` counts 2)."""
+    return sum(isinstance(node, ast.stmt) for stmt in body for node in ast.walk(stmt))
+
+
 def _dedup_key(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     clone = copy.copy(func)
-    clone.body = func.body[1:]                                # without the docstring
+    documented = ast.get_docstring(func, clean=False) is not None
+    clone.body = func.body[1:] if documented else list(func.body)    # without the docstring
     clone.decorator_list = []
     return hashlib.sha1(ast.dump(clone, annotate_fields=False, include_attributes=False).encode()).hexdigest()
 
 
 def extract_functions(source: str, limits: CorpusLimits | None = None, origin: str = "",
                       license_value: str | None = None) -> tuple[list[FunctionPair], Counter]:
-    """Self-contained documented top-level functions of one file, and the counts of what was dropped why."""
+    """Self-contained functions of one file, and the counts of what was dropped why.
+
+    By default: documented top-level functions, context = needed imports + signature + docstring. With
+    ``limits.include_methods`` also the methods of top-level (non-test) classes, named ``Class.method`` and
+    moved to column 0 (``self`` stays a parameter); with ``limits.require_docstring=False`` also undocumented
+    functions of at least ``min_undocumented_statements`` statements, context = needed imports + signature
+    (+ the comment lines before the first statement). The context is always a prefix of the target.
+    """
     limits = limits or CorpusLimits()
     reasons: Counter = Counter()
     if len(source) > limits.max_file_chars:
@@ -443,17 +729,26 @@ def extract_functions(source: str, limits: CorpusLimits | None = None, origin: s
     lines = source.splitlines()
     bindings = _import_bindings(module)
     out: list[FunctionPair] = []
-    for func in module.body:
-        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
+    for func, name, method in _candidates(module, limits):
         reason = _check_function(func, limits)
         if reason:
             reasons[reason] += 1
             continue
-        doc_node = func.body[0]
-        if doc_node.end_lineno is None or func.end_lineno is None or func.body[1].lineno <= doc_node.end_lineno:
+        documented = ast.get_docstring(func, clean=True) is not None
+        if func.end_lineno is None or func.body[0].end_lineno is None:
             reasons["inline_body"] += 1
             continue
+        if documented:
+            doc_node = func.body[0]
+            if len(func.body) < 2 or func.body[1].lineno <= doc_node.end_lineno:   # body on the docstring's line
+                reasons["inline_body"] += 1
+                continue
+            prompt_end = doc_node.end_lineno                          # the signature and the docstring
+        else:
+            prompt_end = func.body[0].lineno - 1                      # the signature only
+            if prompt_end < func.lineno:                              # "def f(x): return x" on one line
+                reasons["inline_body"] += 1
+                continue
         defined, loaded, uses_global = _defined_and_loaded(func)
         if uses_global:
             reasons["global_state"] += 1
@@ -464,8 +759,11 @@ def extract_functions(source: str, limits: CorpusLimits | None = None, origin: s
             continue
         imports = _import_lines(sorted(free), bindings)
         header = "\n".join(imports) + "\n\n\n" if imports else ""
-        prompt = "\n".join(line.rstrip() for line in lines[func.lineno - 1: doc_node.end_lineno]) + "\n"
-        body = "\n".join(line.rstrip() for line in lines[func.lineno - 1: func.end_lineno]).rstrip() + "\n"
+        indent = func.col_offset                                      # a method's lines move to column 0
+        prompt = "\n".join(_dedent(line, indent) for line in lines[func.lineno - 1: prompt_end]) + "\n"
+        body = "\n".join(_dedent(line, indent) for line in lines[func.lineno - 1: func.end_lineno]).rstrip() + "\n"
+        first = _dedent(lines[func.body[0].lineno - 1], indent)
+        body_indent = first[: len(first) - len(first.lstrip(" \t"))] or "    "     # spaces or tabs, as the file
         if body.count("\n") > limits.max_function_lines:
             reasons["too_many_lines"] += 1
             continue
@@ -480,12 +778,40 @@ def extract_functions(source: str, limits: CorpusLimits | None = None, origin: s
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 ast.parse(target)
-                ast.parse(header + prompt + "    pass\n")
+                ast.parse(header + prompt + body_indent + "pass\n")
         except (SyntaxError, ValueError):
             reasons["reassembly"] += 1
             continue
-        out.append(FunctionPair(header + prompt, target, func.name, _dedup_key(func), origin, license_value))
+        out.append(FunctionPair(header + prompt, target, name, _dedup_key(func), origin, license_value,
+                                documented=documented, method=method))
     return out, reasons
+
+
+_TEST_CLASS = re.compile(r"^Test([A-Z0-9_]|$)|Tests?$")     # Test, TestFoo, FooTest, FooTests; not Testimony
+
+
+def _candidates(module: ast.Module, limits: CorpusLimits
+                ) -> Iterator[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str, bool]]:
+    """Top-level functions and (``include_methods``) the methods of top-level classes that are not test
+    classes, in source order: (node, name, is a method); a method is named ``Class.method``."""
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node, node.name, False
+        elif limits.include_methods and isinstance(node, ast.ClassDef) and not (
+                limits.skip_tests and _TEST_CLASS.search(node.name)):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield item, f"{node.name}.{item.name}", True
+
+
+def _dedent(line: str, indent: int) -> str:
+    """``line`` without trailing whitespace and without up to ``indent`` leading spaces or tabs (a method moves
+    to column 0; a continuation line of a multi-line string that starts further left loses what it has)."""
+    line = line.rstrip()
+    if indent <= 0:
+        return line
+    leading = len(line) - len(line.lstrip(" \t"))
+    return line[min(indent, leading):]
 
 
 def _check_function(func: ast.FunctionDef | ast.AsyncFunctionDef, limits: CorpusLimits) -> str | None:
@@ -494,8 +820,13 @@ def _check_function(func: ast.FunctionDef | ast.AsyncFunctionDef, limits: Corpus
     if limits.skip_tests and _TEST_NAME.match(func.name):
         return "test_function"
     doc = ast.get_docstring(func, clean=True)
-    if not doc:
-        return "no_docstring"
+    if doc is None:
+        if limits.require_docstring:
+            return "no_docstring"
+        if _statement_count(func.body) < max(limits.min_body_statements, limits.min_undocumented_statements) \
+                or _trivial_body(func.body):
+            return "trivial_body"
+        return None
     if not limits.min_doc_chars <= len(doc) <= limits.max_doc_chars:
         return "docstring_length"
     body = func.body[1:]
@@ -570,6 +901,8 @@ class CorpusStats:
     contaminated: int = 0
     train: int = 0
     val: int = 0
+    documented: int = 0                      # kept functions (train + val) with a docstring
+    methods: int = 0                         # kept functions that are methods of a class
     dropped: dict[str, int] = field(default_factory=dict)
     licenses: dict[str, int] = field(default_factory=dict)
 
@@ -636,11 +969,14 @@ def build_corpus(sources: Sequence[str], out_dir: str | Path, eval_texts: Sequen
                  licenses: frozenset[str] = PERMISSIVE_LICENSES, allow_unknown_license: bool = False,
                  assume_license: str | None = None, limits: CorpusLimits | None = None, ngram: int = 13,
                  max_functions: int | None = None, val_fraction: float = 0.005, shard_size: int = 100_000,
-                 workers: int = 1, chunk_files: int = 256) -> CorpusStats:
+                 workers: int = 1, chunk_files: int = 256, prefer_documented: bool = False) -> CorpusStats:
     """Run the pipeline of the module docstring; returns the statistics (also written to ``stats.json``).
 
     The output does not depend on ``workers``: files are processed in order and deduplication keeps the first
     occurrence. ``val_fraction`` of the functions (chosen by their dedup key) go to ``val.jsonl.gz``.
+    ``max_functions`` stops the build once that many functions are kept; with ``prefer_documented``
+    undocumented functions are held back and only fill what the documented ones leave of ``max_functions``
+    (all sources are read unless the documented functions alone reach it).
     """
     if not 0.0 <= val_fraction < 1.0:
         raise ValueError("val_fraction must lie in [0, 1)")
@@ -667,8 +1003,23 @@ def build_corpus(sources: Sequence[str], out_dir: str | Path, eval_texts: Sequen
 
     train = _ShardWriter(out, "train", shard_size)
     val = _ShardWriter(out, "val", None)
+    reserve_path = out / "reserve.jsonl.gz.tmp"               # undocumented functions held back
+    reserve = gzip.open(reserve_path, "wt", encoding="utf-8") if prefer_documented and max_functions else None
     seen: set[str] = set()
     threshold = int(val_fraction * 2**32)
+
+    def keep(row: dict, to_val: bool) -> None:
+        stats.documented += row["documented"]
+        stats.methods += row["method"]
+        if to_val:
+            val.write(row)
+            stats.val += 1
+        else:
+            train.write(row)
+            stats.train += 1
+
+    def full() -> bool:
+        return max_functions is not None and stats.train + stats.val >= max_functions
     if workers > 1:
         pool = multiprocessing.get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(limits, decon))
         results = pool.imap(_process_chunk, _chunks(admitted(), chunk_files))
@@ -687,28 +1038,41 @@ def build_corpus(sources: Sequence[str], out_dir: str | Path, eval_texts: Sequen
                     continue
                 seen.add(pair.key)
                 row = {"context": pair.context, "target": pair.target, "language": "python",
-                       "task_id": f"{pair.origin}::{pair.name}", "license": pair.license, "origin": pair.origin}
-                if int(pair.key[:8], 16) < threshold:
-                    val.write(row)
-                    stats.val += 1
-                else:
-                    train.write(row)
-                    stats.train += 1
-                if max_functions is not None and stats.train + stats.val >= max_functions:
+                       "task_id": f"{pair.origin}::{pair.name}", "license": pair.license, "origin": pair.origin,
+                       "documented": pair.documented, "method": pair.method}
+                to_val = int(pair.key[:8], 16) < threshold
+                if reserve is not None and not pair.documented:
+                    reserve.write(json.dumps({"val": to_val, "row": row}, ensure_ascii=False) + "\n")
+                    continue
+                keep(row, to_val)
+                if full():
                     break
-            if max_functions is not None and stats.train + stats.val >= max_functions:
+            if full():
                 break
+        if reserve is not None:                               # fill up with the undocumented functions
+            reserve.close()
+            reserve = None
+            with gzip.open(reserve_path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    if full():
+                        break
+                    held = json.loads(line)
+                    keep(held["row"], held["val"])
     finally:
         if pool is not None:
             pool.terminate()
             pool.join()
+        if reserve is not None:
+            reserve.close()
+        reserve_path.unlink(missing_ok=True)
         train.close()
         val.close()
     stats.dropped = dict(sorted(dropped.items()))
     stats.licenses = dict(licenses_seen.most_common())
     summary = asdict(stats) | {"sources": list(sources), "ngram": ngram, "decontaminated": decon is not None,
                                "limits": asdict(limits), "train_files": [p.name for p in train.paths],
-                               "allowed_licenses": sorted(licenses)}
+                               "allowed_licenses": sorted(licenses), "max_functions": max_functions,
+                               "prefer_documented": prefer_documented}
     (out / "stats.json").write_text(json.dumps(summary, indent=2))
     return stats
 
@@ -726,6 +1090,20 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     d.add_argument("--split", default="train")
     d.add_argument("--out", type=Path, required=True)
     d.add_argument("--max-files", type=int, default=None)
+    r = sub.add_parser("download-shards", help="download a dataset repository's Parquet shards, keeping only "
+                                               "the rows of one language under a permissive license")
+    r.add_argument("--dataset", default="codeparrot/github-code-clean")
+    r.add_argument("--out", type=Path, required=True)
+    r.add_argument("--folder", default="data", help="folder of the shards in the repository")
+    r.add_argument("--revision", default="main")
+    r.add_argument("--pattern", default="*.parquet", help="file names to fetch (glob)")
+    r.add_argument("--shards", default=None, help="indices of the sorted files, e.g. 0-99,200- (default: all)")
+    r.add_argument("--languages", default="Python", help="comma-separated values of the language column")
+    r.add_argument("--extensions", default=".py", help="path extensions when there is no language column")
+    r.add_argument("--licenses", default=",".join(sorted(PERMISSIVE_LICENSES)),
+                   help="comma-separated allowed licenses ('all' keeps every row)")
+    r.add_argument("--workers", type=int, default=8, help="shards downloaded and filtered at a time")
+    r.add_argument("--keep-raw", action="store_true", help="keep the unfiltered shards in OUT/raw")
     b = sub.add_parser("build", help="extract, filter, deduplicate and decontaminate")
     b.add_argument("--source", action="append", required=True,
                    help="dir:PATH | jsonl:GLOB | parquet:GLOB (repeatable; quote globs)")
@@ -741,6 +1119,14 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     b.add_argument("--assume-license", default=None, help="license of files that carry none (dir: sources)")
     b.add_argument("--ngram", type=int, default=13)
     b.add_argument("--max-functions", type=int, default=None)
+    b.add_argument("--include-methods", action="store_true",
+                   help="also methods of top-level classes (named Class.method, moved to column 0)")
+    b.add_argument("--allow-undocumented", action="store_true",
+                   help="also functions without a docstring (context = imports + signature)")
+    b.add_argument("--min-undocumented-statements", type=int, default=CorpusLimits.min_undocumented_statements,
+                   help="statements (nested ones included) an undocumented function needs")
+    b.add_argument("--prefer-documented", action="store_true",
+                   help="with --max-functions: undocumented functions only fill what the documented ones leave")
     b.add_argument("--val-fraction", type=float, default=0.005)
     b.add_argument("--shard-size", type=int, default=100_000)
     b.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
@@ -754,12 +1140,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths = download_hf_parquet(args.dataset, args.config, args.out, args.split, args.max_files)
         print(f"{len(paths)} Parquet file(s) in {args.out}")
         return 0
+    if args.command == "download-shards":
+        licenses = None if args.licenses.strip().lower() == "all" else frozenset(
+            x.strip().lower() for x in args.licenses.split(",") if x.strip())
+        languages = frozenset(x.strip() for x in args.languages.split(",") if x.strip()) or None
+        extensions = tuple(x.strip() for x in args.extensions.split(",") if x.strip())
+        summary = download_hf_shards(args.dataset, args.out, args.folder, args.revision, args.pattern, args.shards,
+                                     languages, extensions, licenses, args.workers, keep_raw=args.keep_raw)
+        print(json.dumps({k: v for k, v in summary.items() if k != "licenses"}, indent=2))
+        return 0
     texts = evaluation_texts(args.humaneval, args.mbpp, args.eval_jsonl)
     if not texts and not args.no_decontamination:
         raise SystemExit("give --humaneval / --mbpp (or --eval-jsonl) to decontaminate, or --no-decontamination")
+    limits = CorpusLimits(include_methods=args.include_methods, require_docstring=not args.allow_undocumented,
+                          min_undocumented_statements=args.min_undocumented_statements)
     stats = build_corpus(args.source, args.out, texts, frozenset(x.strip().lower() for x in args.licenses.split(",")),
-                         args.allow_unknown_license, args.assume_license, None, args.ngram, args.max_functions,
-                         args.val_fraction, args.shard_size, args.workers)
+                         args.allow_unknown_license, args.assume_license, limits, args.ngram, args.max_functions,
+                         args.val_fraction, args.shard_size, args.workers, prefer_documented=args.prefer_documented)
     print(json.dumps({k: v for k, v in asdict(stats).items() if k not in ("licenses",)}, indent=2))
     if stats.train == 0:
         print("warning: no training function was kept", file=sys.stderr)
