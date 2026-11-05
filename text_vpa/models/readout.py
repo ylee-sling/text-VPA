@@ -12,7 +12,9 @@ section numbers (contracts). ``PlanReadout`` decodes from the predicted plan Z_t
     text      per slot, the slot text in L_text parallel token positions (one classifier per position,
               no autoregression), e.g. "def total(xs: List[int]) -> int"; signatures are parsed from it
     inventory per sample, which identifier-bearing tokens the program uses (multi-label over V); these
-              are the tokens ``PlanVocabularyEnergy`` licenses
+              are the tokens ``PlanVocabularyEnergy`` licenses. Trained with class-balanced BCE (a program
+              uses tens of the S tokens); the decision threshold is calibrated on held-out data to a target
+              recall (``InventoryCalibration``), since an unlicensed token the program needs is penalised
     length    per sample, the output length bucket, so the canvas length N can be set from the plan
 
 Training (Stage 2, Sec. 5.1): the readout learns on the *predicted* plan of the frozen planner against
@@ -39,7 +41,8 @@ if TYPE_CHECKING:
     from text_vpa.data.tokenization import TextVPATokenizer
     from text_vpa.inference.energy_terms import PlanConstraints, VocabularyAnalysis
 
-__all__ = ["PlanReadout", "ReadoutOutput", "ReadoutTargets", "TEXT_KINDS"]
+__all__ = ["InventoryCalibration", "PlanReadout", "ReadoutOutput", "ReadoutTargets", "TEXT_KINDS",
+           "balanced_bce_with_logits"]
 
 NUM_KINDS = len(SlotKind)
 #: Slot kinds whose text is decoded (signatures feed the arity and type energies).
@@ -111,9 +114,13 @@ class PlanReadout(nn.Module):
         """Bucket index of output lengths ``[B]`` (clamped to the last bucket)."""
         return ((lengths.clamp_min(1) - 1) // self.length_bucket_size).clamp_max(self.num_length_buckets - 1)
 
-    def loss(self, out: ReadoutOutput, targets: ReadoutTargets, pad_id: int, weights: Sequence[float] = (1, 1, 1, 0.1)
-             ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Kind CE + slot-text CE (non-[PAD] positions of text slots) + inventory BCE + length CE."""
+    def loss(self, out: ReadoutOutput, targets: ReadoutTargets, pad_id: int, weights: Sequence[float] = (1, 1, 1, 0.1),
+             inventory_loss: str = "balanced") -> tuple[Tensor, dict[str, Tensor]]:
+        """Kind CE + slot-text CE (non-[PAD] positions of text slots) + inventory BCE + length CE.
+
+        ``inventory_loss``: ``"balanced"`` (``balanced_bce_with_logits``) or ``"mean"`` (BCE averaged over
+        all B x S entries, which the negatives dominate).
+        """
         w_kind, w_text, w_inv, w_len = weights
         kind = F.cross_entropy(out.kind_logits.reshape(-1, NUM_KINDS), targets.kinds.reshape(-1))
         if bool(targets.text_mask.any()):
@@ -128,7 +135,12 @@ class PlanReadout(nn.Module):
             text = F.cross_entropy(self.text_out(hidden[keep]), gold[keep])
         else:
             text = out.kind_logits.sum() * 0.0
-        inventory = F.binary_cross_entropy_with_logits(out.inventory_logits, targets.inventory)
+        if inventory_loss == "balanced":
+            inventory = balanced_bce_with_logits(out.inventory_logits, targets.inventory)
+        elif inventory_loss == "mean":
+            inventory = F.binary_cross_entropy_with_logits(out.inventory_logits, targets.inventory)
+        else:
+            raise ValueError(f"unknown inventory_loss {inventory_loss!r} (balanced, mean)")
         length = F.cross_entropy(out.length_logits, targets.length_bucket)
         total = w_kind * kind + w_text * text + w_inv * inventory + w_len * length
         return total, {"readout_kind": kind.detach(), "readout_text": text.detach(),
@@ -162,6 +174,84 @@ class PlanReadout(nn.Module):
             plans.append(PlanConstraints(licensed_tokens=licensed, signatures=signatures,
                                          declared_identifiers=frozenset(declared), source="readout"))
         return plans, lengths
+
+
+def balanced_bce_with_logits(logits: Tensor, targets: Tensor) -> Tensor:
+    """Class-balanced BCE: (mean over positives of -log sigma(l) + mean over negatives of -log(1 - sigma(l))) / 2.
+
+    ``logits``, ``targets`` [B, S] (targets in {0, 1}); the means pool the whole batch. Plain BCE averaged over
+    B x S lets the ~S negatives of every example outweigh its tens of positives, so the head learns to
+    license almost nothing above sigma = 0.5 (Run 1: a third of the reference's identifier tokens).
+    """
+    targets = targets.to(logits.dtype)
+    positive = targets.sum()
+    negative = targets.numel() - positive
+    pos_term = (targets * F.softplus(-logits)).sum() / positive.clamp_min(1.0)          # -log sigma(l)
+    neg_term = ((1.0 - targets) * F.softplus(logits)).sum() / negative.clamp_min(1.0)   # -log(1 - sigma(l))
+    return 0.5 * (pos_term + neg_term)
+
+
+class InventoryCalibration:
+    """Calibrates the inventory threshold to a target recall on held-out plans.
+
+    ``update`` accumulates, over evaluation batches, histograms of the inventory logits of the positive and
+    of the negative candidate tokens on a fixed logit grid (``GRID``, step 0.05); ``result(recall)`` returns
+    the largest grid threshold whose pooled recall (licensed positives / positives) reaches ``recall``, with
+    the precision and the number of tokens licensed per plan there. A token is licensed iff its logit
+    exceeds the threshold (sigma(l) > sigma(threshold), as ``PlanReadout.decode``). Histograms of several
+    processes add up (``counts`` / ``load_counts``).
+
+    Args:
+        candidates: [S] bool, the tokens that can be licensed (identifier-bearing); None = all.
+    """
+
+    GRID = torch.linspace(-16.0, 16.0, 641, dtype=torch.float64)
+
+    def __init__(self, candidates: Tensor | None = None) -> None:
+        self.candidates = None if candidates is None else candidates.bool().cpu()
+        self.positive = torch.zeros(len(self.GRID) + 1, dtype=torch.float64)    # [G + 1] bucket counts
+        self.negative = torch.zeros(len(self.GRID) + 1, dtype=torch.float64)
+        self.examples = 0
+
+    @torch.no_grad()
+    def update(self, logits: Tensor, targets: Tensor) -> None:
+        """``logits`` [B, S], ``targets`` [B, S] multi-hot."""
+        logits = logits.detach().float().cpu()
+        targets = targets.detach().cpu() > 0.5
+        keep = torch.ones_like(targets) if self.candidates is None else self.candidates[None, :].expand_as(targets)
+        grid = self.GRID.float()
+        for chosen, hist in ((targets & keep, self.positive), (~targets & keep, self.negative)):
+            bucket = torch.bucketize(logits[chosen], grid)                     # number of grid points < logit
+            hist += torch.bincount(bucket, minlength=len(grid) + 1).to(torch.float64)
+        self.examples += int(logits.shape[0])
+
+    def counts(self) -> Tensor:
+        """[2G + 3] float64: the histograms and the example count (for an all-reduce sum)."""
+        return torch.cat([self.positive, self.negative, torch.tensor([float(self.examples)], dtype=torch.float64)])
+
+    def load_counts(self, counts: Tensor) -> None:
+        g = len(self.GRID) + 1
+        counts = counts.detach().cpu().to(torch.float64)
+        self.positive, self.negative, self.examples = counts[:g].clone(), counts[g:2 * g].clone(), int(counts[-1])
+
+    def result(self, recall: float) -> dict[str, float] | None:
+        """{"inventory_threshold" (a probability), "logit", "recall", "precision", "licensed_per_plan",
+        "target_recall", "examples"}, or None without positives."""
+        if not 0.0 < recall < 1.0:
+            raise ValueError("recall must lie in (0, 1)")
+        total = float(self.positive.sum())
+        if total <= 0:
+            return None
+        # above[k]: tokens with logit > GRID[k] = those in buckets k + 1 .. G
+        pos_above = self.positive.flip(0).cumsum(0).flip(0)[1:]
+        neg_above = self.negative.flip(0).cumsum(0).flip(0)[1:]
+        reached = (pos_above / total >= recall).nonzero().flatten()
+        k = int(reached.max()) if reached.numel() else 0
+        licensed = float(pos_above[k] + neg_above[k])
+        return {"inventory_threshold": float(torch.sigmoid(self.GRID[k])), "logit": float(self.GRID[k]),
+                "recall": float(pos_above[k]) / total, "precision": float(pos_above[k]) / max(licensed, 1.0),
+                "licensed_per_plan": licensed / max(self.examples, 1), "target_recall": recall,
+                "examples": self.examples}
 
 
 def _parse_signature(text: str, extractor: TreeSitterASTExtractor):

@@ -320,6 +320,9 @@ class DataConfig(_Section):
     tokenizer: Literal["byte", "bpe", "hf"] = "bpe"
     tokenizer_name: str | None = Field(None, description="Hugging Face name or path when tokenizer = hf.")
     bpe_vocab_size: int = Field(4096, ge=265, description="Size of a BPE trained on the training corpus.")
+    bpe_train_records: int | None = Field(200_000, ge=1, description=(
+        "Records (evenly spaced over the corpus) whose targets and contexts train the BPE; null = all. The "
+        "merges of a code BPE are stable well before 10^5 functions, and training on millions costs tens of GB."))
     mode_scheme: Literal["control", "control_library"] = "control_library"
     max_context_tokens: int = Field(512, ge=1)
     max_output_tokens: int = Field(512, ge=1)
@@ -340,7 +343,15 @@ class ReadoutConfig(_Section):
     hidden_dim: int = Field(256, ge=1)
     max_text_tokens: int = Field(48, ge=1)
     length_bucket_size: int = Field(32, ge=1)
-    inventory_threshold: float = Field(0.5, gt=0.0, lt=1.0)
+    inventory_threshold: float = Field(0.5, gt=0.0, lt=1.0, description=(
+        "sigma threshold of a licensed inventory token when the checkpoint holds no calibration "
+        "(see inventory_recall)."))
+    inventory_loss: Literal["balanced", "mean"] = Field("balanced", description=(
+        "Inventory BCE: class-balanced (positives and negatives averaged separately) or the plain mean over B x S."))
+    inventory_recall: float | None = Field(0.95, gt=0.0, lt=1.0, description=(
+        "Every Stage-2/3 evaluation calibrates the inventory threshold to this pooled recall of the reference's "
+        "identifier tokens on the evaluation set and stores it in the checkpoint ('calibration'), where "
+        "inference reads it; null: always inventory_threshold."))
     kind_weight: float = Field(1.0, ge=0.0)
     text_weight: float = Field(1.0, ge=0.0)
     inventory_weight: float = Field(1.0, ge=0.0)
@@ -354,7 +365,9 @@ class EnergyConfig(_Section):
     plan_source: Literal["readout", "reference", "none"] = Field(
         "readout", description="Symbolic plan for the energies: decoded from Z_target, oracle from the reference "
                                "(evaluation only), or none.")
-    identifier_weight: float = Field(math.inf, gt=0.0)
+    identifier_weight: float = Field(2.0, gt=0.0, description=(
+        "Plan-vocabulary energy of an identifier-bearing token the plan does not license: soft (exp(-2) = 0.14 "
+        "of its posterior at T = 1), as the readout's inventory misses some tokens a program needs; .inf = hard."))
     grammar_weight: float = Field(math.inf, gt=0.0)
     arity_weight: float = Field(5.0, gt=0.0)
     type_weight: float = Field(5.0, gt=0.0)
@@ -372,8 +385,8 @@ class SamplerConfig(_Section):
     audit_depth: bool = Field(True, description="Runtime assertion that a generation costs exactly K + 3 passes.")
     repair_aware: bool = False
     default_length: int | None = Field(None, ge=1, description="Canvas length N; None: the readout's length head.")
-    license_context: bool = Field(False, description="Also license the words of the context c in the plan-vocabulary "
-                                                     "energy (draft-independent, so Prop. 4(d) holds).")
+    license_context: bool = Field(True, description="Also license the words of the context c in the plan-vocabulary "
+                                                    "energy (draft-independent, so Prop. 4(d) holds).")
 
 
 # ---------------------------------------------------------------------------------------------

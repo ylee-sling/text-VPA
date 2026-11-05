@@ -18,7 +18,7 @@
 #               and configuration files, the environment of a running tmux server, CUDA_VISIBLE_DEVICES
 #   text-VPA    the clone (branch, local changes, behind GitHub); an earlier run, corpus and checkpoints
 #   network     GitHub, PyPI, the PyTorch wheel index (drivers older than 580), HumanEval and MBPP, and the
-#               corpus files on Hugging Face (HF_DATASET, HF_CONFIG, HF_TOKEN as in train_l4.sh)
+#               corpus files on Hugging Face (CORPUS, HF_DATASET, HF_CONFIG, HF_TOKEN as in train_l4.sh)
 # The other variables run_all.sh reads (PYTHON, TORCH_INDEX_URL, KEEP_ENV, CORPUS_SOURCE, DATA, RUN, SESSION)
 # are taken into account.
 set -uo pipefail
@@ -28,6 +28,7 @@ MIN_FREE_GB="${MIN_FREE_GB:-60}"
 HF_DATASET="${HF_DATASET:-codeparrot/github-code-clean}"
 HF_CONFIG="${HF_CONFIG:-Python-all}"
 HF_FILES="${HF_FILES:-10}"
+CORPUS="${CORPUS:-shards}"
 SESSION="${SESSION:-textvpa}"
 SHUTDOWN_ON_SUCCESS="${SHUTDOWN_ON_SUCCESS:-1}"
 SHUTDOWN_ON_FAILURE="${SHUTDOWN_ON_FAILURE:-1}"
@@ -87,11 +88,14 @@ avail="$(df --output=avail -BG "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')"
 mount_point="$(df --output=target "$ROOT" 2>/dev/null | tail -1)"
 if [[ -z "$avail" ]]; then
   fail "cannot read the free space of $ROOT"
-elif (( avail >= MIN_FREE_GB )); then
-  pass "disk: $avail GB free on $mount_point (run_all.sh needs $MIN_FREE_GB; the run uses about 30 GB)"
 else
-  fail "disk: $avail GB free on $mount_point; run_all.sh needs $MIN_FREE_GB GB (the run uses about 30 GB):" \
-    "free space or enlarge the boot disk"
+  uses="about 30 GB"; [[ "$CORPUS" == shards ]] && uses="about 60 GB with CORPUS=shards"
+  if (( avail >= MIN_FREE_GB )); then
+    pass "disk: $avail GB free on $mount_point (run_all.sh needs $MIN_FREE_GB; the run uses $uses)"
+  else
+    fail "disk: $avail GB free on $mount_point; run_all.sh needs $MIN_FREE_GB GB (the run uses $uses):" \
+      "free space or enlarge the boot disk"
+  fi
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -305,17 +309,30 @@ if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
 else
   warn "$ROOT is not a git clone: it cannot be updated with git pull"
 fi
-if [[ -f "$ROOT/runs/run_all.done" ]]; then
-  warn "a run finished earlier ($(cat "$ROOT/runs/run_all.done")): run_all.sh does not start another. To start" \
-    "over: rm -rf $ROOT/runs/l4 $ROOT/runs/run_all.* (keep data/ to reuse the corpus)"
+done_marker="$RUN_DIR/run_all.done"
+[[ ! -f "$done_marker" && "$RUN_DIR" == "$ROOT/runs/l4" && -f "$ROOT/runs/run_all.done" ]] && done_marker="$ROOT/runs/run_all.done"
+if [[ -f "$done_marker" ]]; then
+  warn "the run in $RUN_DIR finished earlier ($(cat "$done_marker")): run_all.sh does not start it again. Another" \
+    "run takes a new RUN (and DATA for another corpus), e.g. RUN=runs/run2 DATA=data2"
 fi
 for marker in failed interrupted; do
-  if [[ -f "$ROOT/runs/run_all.$marker" ]]; then
-    info "the previous run $marker ($(cat "$ROOT/runs/run_all.$marker")): run_all.sh resumes from the last checkpoint"
-  fi
+  for f in "$RUN_DIR/run_all.$marker" "$ROOT/runs/run_all.$marker"; do
+    [[ "$f" == "$ROOT/runs/run_all.$marker" && "$RUN_DIR" != "$ROOT/runs/l4" ]] && continue
+    if [[ -f "$f" ]]; then
+      info "the previous run $marker ($(cat "$f")): run_all.sh resumes from the last checkpoint"
+      break
+    fi
+  done
 done
 if [[ -s "$DATA_DIR/corpus/stats.json" ]]; then
-  corpus_built=1; info "the corpus is built ($DATA_DIR/corpus): no download"
+  corpus_built=1
+  recipe="$(cat "$DATA_DIR/corpus/recipe" 2>/dev/null || echo "export (no recipe recorded)")"
+  if [[ -z "${CORPUS_SOURCE:-}" && "$recipe" != "$CORPUS"* ]]; then
+    fail "$DATA_DIR/corpus was built by another recipe ($recipe) than CORPUS=$CORPUS: train_l4.sh refuses it;" \
+      "use a new DATA directory (e.g. DATA=data2)"
+  else
+    info "the corpus is built ($DATA_DIR/corpus: $recipe): no download"
+  fi
 fi
 [[ -s "$RUN_DIR/stage1/stage1_final.pt" ]] && info "Stage 1 finished earlier ($RUN_DIR/stage1/stage1_final.pt): it is not rerun"
 [[ -s "$RUN_DIR/stage2/stage2_final.pt" ]] && info "Stage 2 finished earlier ($RUN_DIR/stage2/stage2_final.pt): it is not rerun"
@@ -371,6 +388,38 @@ else
     info "Hugging Face is not needed (${CORPUS_SOURCE:+CORPUS_SOURCE=$CORPUS_SOURCE}${CORPUS_SOURCE:-corpus built})"
   elif [[ -z "$JSON_PY" ]]; then
     warn "no python3 to read Hugging Face's file listing; the corpus download is not checked"
+  elif [[ "$CORPUS" == shards ]]; then
+    # download-shards: the Parquet files under data/ of the repository's main branch, then one ranged read
+    auth=()
+    [[ -n "${HF_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+    tree="https://huggingface.co/api/datasets/$HF_DATASET/tree/main/data?recursive=true"
+    response="$(curl -sS --max-time "$WAIT" --retry 2 "${auth[@]}" -w $'\n%{http_code}' "$tree" 2>/dev/null)"
+    status="${response##*$'\n'}"
+    read -r count gigabytes first < <(printf '%s' "${response%$'\n'*}" | "$JSON_PY" -I -c '
+import json, sys, urllib.parse
+try:
+    entries = json.load(sys.stdin)
+except ValueError:
+    entries = []
+files = sorted((e["path"], e.get("size") or 0) for e in (entries if isinstance(entries, list) else [])
+               if isinstance(e, dict) and e.get("type") == "file" and str(e.get("path", "")).endswith(".parquet"))
+url = (f"https://huggingface.co/datasets/{sys.argv[1]}/resolve/main/{urllib.parse.quote(files[0][0])}"
+       if files else "-")
+print(len(files), round(sum(s for _, s in files) / 1e9), url)' "$HF_DATASET")
+    if [[ "${count:-0}" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+      magic="$(curl -sSL --max-time "$WAIT" -r 0-3 "${auth[@]}" "$first" 2>/dev/null | head -c 4)"
+      if [[ "$magic" == PAR1 ]]; then
+        pass "Hugging Face: $count shard(s) of $HF_DATASET listed under data/ (about $gigabytes GB, the first" \
+          "page of the listing); the first one downloads"
+      else
+        fail "Hugging Face lists $count shard(s) of $HF_DATASET, but the first one does not download: $first"
+      fi
+    elif [[ -z "$status" || "$status" == 000 ]]; then
+      fail "cannot reach huggingface.co (the corpus download): check the VM's external IP or Cloud NAT and firewall"
+    else
+      fail "Hugging Face: no shards of $HF_DATASET under data/: $tree answered HTTP $status" \
+        "${HF_TOKEN:+(HF_TOKEN was sent)}"
+    fi
   else
     auth=()
     [[ -n "${HF_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $HF_TOKEN")

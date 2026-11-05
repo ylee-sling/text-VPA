@@ -39,7 +39,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from text_vpa.configs.schema import TextVPAConfig
 from text_vpa.data.dataset import Batch, epoch_batches
-from text_vpa.data.tokenization import TextVPATokenizer
+from text_vpa.data.tokenization import TextVPATokenizer, word_bearing_mask
 from text_vpa.engine.losses import PlanLoss, StableRankMonitor, masked_rows
 from text_vpa.engine.runtime import (
     DistributedContext,
@@ -58,7 +58,7 @@ from text_vpa.engine.runtime import (
 from text_vpa.models.ema import EMATargetEncoder
 from text_vpa.models.encoders import TargetEncoder
 from text_vpa.models.plan import PredictedPlan
-from text_vpa.models.readout import ReadoutTargets
+from text_vpa.models.readout import InventoryCalibration, ReadoutTargets
 from text_vpa.models.realizers.fs_dfm import ConditionalFSDFMRealizer
 from text_vpa.models.realizers.paths import mixture_path_sample
 from text_vpa.models.text_vpa_model import TextVPAModel
@@ -104,7 +104,8 @@ class RealizerObjective(nn.Module):
             targets = ReadoutTargets(batch.slot_kinds, batch.slot_texts, batch.slot_text_mask, batch.inventory,
                                      readout.length_bucket(batch.target_lengths + 1))
             loss_ro, ro_terms = readout.loss(out, targets, self.pad_id, (ocfg.kind_weight, ocfg.text_weight,
-                                                                         ocfg.inventory_weight, ocfg.length_weight))
+                                                                         ocfg.inventory_weight, ocfg.length_weight),
+                                             ocfg.inventory_loss)
             total = total + tcfg.readout_weight * loss_ro
             terms.update(ro_terms)
         return total, terms
@@ -152,6 +153,7 @@ class Stage2Trainer:
         self.epoch = 0                      # data position, so a resumed run continues the same stream
         self.batch_in_epoch = 0
         self.best_eval: float | None = None
+        self.calibration: dict[str, float] | None = None    # inventory threshold of the last evaluation
         self._configure()
 
     # -----------------------------------------------------------------------------------------
@@ -248,17 +250,36 @@ class Stage2Trainer:
 
     @torch.no_grad()
     def evaluate(self, loader: Iterable[Batch], seed: int = 1234) -> float:
-        """Mean training objective on ``loader`` with fixed corruption noise and no plan dropout."""
+        """Mean training objective on ``loader`` with fixed corruption noise and no plan dropout.
+
+        With ``readout.inventory_recall`` it also calibrates the inventory threshold on these plans
+        (``InventoryCalibration``, pooled over the ranks) into ``self.calibration``, which checkpoints store.
+        """
         was = torch.get_rng_state()
         torch.manual_seed(seed)
         self.model.eval()
+        recall = self.cfg.readout.inventory_recall
+        calibration = None
+        if self.model.readout is not None and recall is not None:
+            calibration = InventoryCalibration(torch.tensor(word_bearing_mask(self.tokenizer)))
         total, count = 0.0, 0
         for batch in loader:
             batch = batch.to(self.device)
-            loss, _ = self.objective(batch, self.plan(batch))
+            plan = self.plan(batch)
+            loss, _ = self.objective(batch, plan)
             total += float(loss) * batch.batch_size
             count += batch.batch_size
+            if calibration is not None:
+                calibration.update(self.model.readout(plan.z_target.float()).inventory_logits, batch.inventory)
         torch.set_rng_state(was)
+        if calibration is not None:
+            calibration.load_counts(self.ctx.all_sum(calibration.counts()))
+            self.calibration = calibration.result(recall)
+            if self.calibration is not None:
+                names = {"inventory_threshold": "inventory_threshold", "recall": "inventory_recall",
+                         "precision": "inventory_precision", "licensed_per_plan": "inventory_licensed_per_plan"}
+                self.logger.log(self.step, {names[k]: v for k, v in self.calibration.items() if k in names},
+                                prefix=f"stage{self.stage}/")
         return self.ctx.mean(total / max(count, 1))
 
     def train(self, max_steps: int | None = None, eval_every: int | None = None) -> Stage2Result:
@@ -314,7 +335,7 @@ class Stage2Trainer:
             "realizer": self.model.realizer.state_dict(), "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(), "rng": rng_state(), "rejected": False,
             "source_checkpoint": self.source_checkpoint, "best_eval_loss": self.best_eval,
-            "epoch": self.epoch, "batch_in_epoch": self.batch_in_epoch,
+            "epoch": self.epoch, "batch_in_epoch": self.batch_in_epoch, "calibration": self.calibration,
         }
         if self.model.readout is not None:
             out["readout"] = self.model.readout.state_dict()
@@ -340,6 +361,7 @@ class Stage2Trainer:
         self.epoch = int(state.get("epoch", 0))
         self.batch_in_epoch = int(state.get("batch_in_epoch", 0))
         self.best_eval = state.get("best_eval_loss")
+        self.calibration = state.get("calibration")
         if self.stage == 2:
             self._fingerprint = self.planner_fingerprint()
 

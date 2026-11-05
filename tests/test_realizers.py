@@ -25,6 +25,7 @@ import math
 from collections import Counter
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -763,7 +764,8 @@ def _targets(seed: int, with_text: bool = True) -> tuple[ReadoutTargets, list[li
 
 
 def _readout_loss_reference64(readout: PlanReadout, out: ReadoutOutput, targets: ReadoutTargets,
-                              slots: list[list[int]], weights: tuple[float, ...]) -> dict[str, float]:
+                              slots: list[list[int]], weights: tuple[float, ...],
+                              inventory_loss: str = "balanced") -> dict[str, float]:
     kind = -_log_softmax64(_w(out.kind_logits)).gather(-1, targets.kinds[..., None]).mean()
     text_nll, count = 0.0, 0
     for b, m, n_tok in slots:
@@ -775,7 +777,13 @@ def _readout_loss_reference64(readout: PlanReadout, out: ReadoutOutput, targets:
             count += 1
     text = text_nll / count if count else 0.0
     x, y = _w(out.inventory_logits), targets.inventory.double()
-    inventory = (torch.clamp(x, min=0) - x * y + torch.log1p(torch.exp(-x.abs()))).mean()  # BCE with logits
+    if inventory_loss == "mean":
+        inventory = (torch.clamp(x, min=0) - x * y + torch.log1p(torch.exp(-x.abs()))).mean()  # BCE with logits
+    else:                                    # class-balanced: positives and negatives averaged separately
+        xs, ys = x.detach().numpy().ravel(), y.numpy().ravel()
+        pos = [float(np.logaddexp(0.0, -v)) for v, t in zip(xs, ys, strict=True) if t == 1.0]   # -log sigma
+        neg = [float(np.logaddexp(0.0, v)) for v, t in zip(xs, ys, strict=True) if t == 0.0]    # -log(1 - sigma)
+        inventory = 0.5 * (sum(pos) / max(len(pos), 1) + sum(neg) / max(len(neg), 1))
     length = -_log_softmax64(_w(out.length_logits)).gather(-1, targets.length_bucket[:, None]).mean()
     terms = {"readout_kind": float(kind), "readout_text": text, "readout_inventory": float(inventory),
              "readout_length": float(length)}
@@ -784,14 +792,15 @@ def _readout_loss_reference64(readout: PlanReadout, out: ReadoutOutput, targets:
     return terms
 
 
+@pytest.mark.parametrize("inventory_loss", ["balanced", "mean"])
 @pytest.mark.parametrize("weights", [(1.0, 1.0, 1.0, 0.1), (0.5, 2.0, 0.3, 1.0)])
-def test_readout_loss_components_match_hand_computation(weights: tuple[float, ...]) -> None:
+def test_readout_loss_components_match_hand_computation(weights: tuple[float, ...], inventory_loss: str) -> None:
     readout = _readout()
     z = torch.randn(2, 4, LATENT, generator=torch.Generator().manual_seed(1))
     out = readout(z)
     targets, slots = _targets(2)
-    total, terms = readout.loss(out, targets, PAD, weights)
-    expected = _readout_loss_reference64(readout, out, targets, slots, weights)
+    total, terms = readout.loss(out, targets, PAD, weights, inventory_loss)
+    expected = _readout_loss_reference64(readout, out, targets, slots, weights, inventory_loss)
     for key in ("readout_kind", "readout_text", "readout_inventory", "readout_length"):
         assert float(terms[key]) == pytest.approx(expected[key], rel=1e-5, abs=1e-6), key
     assert float(total.detach()) == pytest.approx(expected["total"], rel=1e-5, abs=1e-6)
@@ -805,6 +814,62 @@ def test_readout_loss_without_text_slots_has_a_zero_text_term() -> None:
     expected = _readout_loss_reference64(readout, out, targets, slots, (1.0, 1.0, 1.0, 0.1))
     assert float(terms["readout_text"]) == 0.0
     assert float(total.detach()) == pytest.approx(expected["total"], rel=1e-5, abs=1e-6)
+
+
+def test_balanced_inventory_loss_weighs_positives_and_negatives_equally() -> None:
+    """With 2 positives among 2 x 8 entries, the balanced loss is the mean of the two class means; its gradient
+    on a positive logit is -(1 - sigma)/(2 n_pos) (plain BCE: -(1 - sigma)/(B S)), so positives are not
+    drowned by the negatives."""
+    from text_vpa.models.readout import balanced_bce_with_logits
+
+    logits = torch.tensor([[2.0, -1.0, 0.5, -3.0, 0.0, 1.0, -2.0, 4.0], [-0.5, 3.0, -4.0, 0.25, 2.5, -1.5, 1.5, -2.5]],
+                          requires_grad=True)
+    targets = torch.zeros(2, 8)
+    targets[0, 2] = targets[1, 1] = 1.0
+    loss = balanced_bce_with_logits(logits, targets)
+    pos = [math.log1p(math.exp(-0.5)), math.log1p(math.exp(-3.0))]
+    neg = [math.log1p(math.exp(v)) for i, row in enumerate(logits.tolist()) for j, v in enumerate(row)
+           if not targets[i, j]]
+    assert float(loss.detach()) == pytest.approx(0.5 * (sum(pos) / 2 + sum(neg) / 14), rel=1e-6)
+    loss.backward()
+    sigma = 1.0 / (1.0 + math.exp(-0.5))
+    assert float(logits.grad[0, 2]) == pytest.approx(-(1.0 - sigma) / 4, rel=1e-5)
+    assert float(logits.grad[0, 0]) == pytest.approx((1.0 / (1.0 + math.exp(-2.0))) / 28, rel=1e-5)
+    with pytest.raises(ValueError):
+        _readout().loss(_readout()(torch.zeros(2, 4, LATENT)), _targets(0)[0], PAD, inventory_loss="focal")
+
+
+def test_inventory_calibration_picks_the_largest_threshold_reaching_the_recall() -> None:
+    """Positive logits 3.02, 1.02, -0.52, -2.02 (4); candidate negatives 0.48, -1.02, -3.02, 2.02; token 5 is
+    not a candidate (logit 5, ignored). Recall 0.75 needs 3 positives above the threshold: the largest grid
+    point (step 0.05) below -0.52 is -0.55, where 2 negatives (0.48, 2.02) are above too."""
+    from text_vpa.models.readout import InventoryCalibration
+
+    logits = torch.tensor([[3.02, 0.48, -0.52, -1.02, 9.0, 5.0], [1.02, -3.02, -2.02, 2.02, -9.0, 5.0]])
+    targets = torch.tensor([[1, 0, 1, 0, 0, 0], [1, 0, 1, 0, 0, 0]], dtype=torch.float32)
+    targets[0, 4] = 0.0
+    candidates = torch.tensor([True, True, True, True, False, False])
+    cal = InventoryCalibration(candidates)
+    cal.update(logits, targets)
+    out = cal.result(0.75)
+    assert out["logit"] == pytest.approx(-0.55, abs=1e-9) and out["recall"] == 0.75
+    assert out["inventory_threshold"] == pytest.approx(1.0 / (1.0 + math.exp(0.55)), rel=1e-9)
+    assert out["licensed_per_plan"] == pytest.approx(5 / 2) and out["precision"] == pytest.approx(3 / 5)
+    full = cal.result(0.99)                                  # all 4 positives: below -2.02 -> -2.05
+    assert full["logit"] == pytest.approx(-2.05, abs=1e-9) and full["recall"] == 1.0
+    # decode's rule (sigma(l) > threshold) licenses exactly the tokens above the calibrated logit
+    licensed = (torch.sigmoid(logits) > out["inventory_threshold"]) & candidates
+    assert int(licensed.sum()) == 5 and bool(licensed[0, 2]) and not bool(licensed[1, 2])
+    # histograms of several processes add up to the histogram of all the data
+    a, b = InventoryCalibration(candidates), InventoryCalibration(candidates)
+    a.update(logits[:1], targets[:1])
+    b.update(logits[1:], targets[1:])
+    merged = InventoryCalibration(candidates)
+    merged.load_counts(a.counts() + b.counts())
+    assert merged.result(0.75) == out
+    assert InventoryCalibration().result(0.5) is None        # no positives seen
+    with pytest.raises(ValueError):
+        cal.result(1.0)
 
 
 def test_length_bucket_k_covers_lengths_in_k_bs_to_k_plus_1_bs() -> None:

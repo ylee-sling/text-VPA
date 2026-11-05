@@ -103,6 +103,14 @@ class DistributedContext:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return float(t.item()) / self.world_size
 
+    def all_sum(self, tensor: torch.Tensor) -> torch.Tensor:
+        """``tensor`` summed over the ranks (a new tensor on the same device; all ranks must call this)."""
+        if not self.enabled:
+            return tensor.clone()
+        out = tensor.to(self.device).clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        return out.to(tensor.device)
+
     def barrier(self) -> None:
         if self.enabled:
             dist.barrier()

@@ -220,9 +220,12 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
             print(f"    {name:<19} {score.line()}")
         n = max(len(picked), 1)
         if analysis is not None:
-            print(f"    plan-vocabulary energy: the readout licenses {licensed_size / n:.0f} tokens per plan (plus "
-                  f"{len(base)} keyword/builtin tokens); they cover {covered / n:.0%} of the reference's word "
-                  f"tokens, {covered_with_context / n:.0%} with the context's words licensed")
+            threshold, source = loaded.inventory_threshold()
+            print(f"    plan-vocabulary energy (weight {cfg.energy.identifier_weight:g}, inventory threshold "
+                  f"{threshold:.3g}, {source}; context licensed: {cfg.sampler.license_context}): the readout "
+                  f"licenses {licensed_size / n:.0f} tokens per plan (plus {len(base)} keyword/builtin tokens); "
+                  f"they cover {covered / n:.0%} of the reference's word tokens, {covered_with_context / n:.0%} "
+                  "with the context's words licensed")
         verdict[split] = scores["as evaluated"]
         verdict[split + " / reference length"] = scores["reference length"]
         verdict[split + " / no energies"] = scores["no energies"]
@@ -283,7 +286,8 @@ def reading(verdict: dict[str, Score]) -> None:
             print("  (scripts/gcp/overfit_check.sh) before collecting more data.")
         if not _reproduces(train) and (better(off) or better(ctx)):
             print("  Separately, the plan-vocabulary energy makes generation worse (compare 'as evaluated' with 'no")
-            print("  energies' and 'context licensed'): evaluate with --no-energy or --license-context.")
+            print("  energies' and 'context licensed'): evaluate with --no-energy, --license-context or a softer")
+            print("  --identifier-weight.")
         return
     if _reproduces(train):
         print("  It reproduces its training targets but not unseen programs: it memorized the corpus and does")
@@ -295,7 +299,8 @@ def reading(verdict: dict[str, Score]) -> None:
         which = "with the context's words licensed" if better(ctx) else "without the energies"
         print(f"  It fails on its own training contexts as evaluated, but does much better {which}: the")
         print("  plan-vocabulary energy (the readout's inventory) forbids the tokens it needs. Evaluate with")
-        print("  --license-context (or --no-energy) before concluding anything about the realizer.")
+        print("  --license-context, a softer --identifier-weight (or --no-energy) before concluding anything about")
+        print("  the realizer.")
     else:
         print("  It fails even on contexts it trained on, with any length and with or without the energies:")
         print("  the sampling path does not match training (or Stage 2 never learned to realize); investigate")

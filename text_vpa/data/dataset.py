@@ -32,6 +32,7 @@ import math
 import multiprocessing
 import pickle
 import random
+import sys
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -43,7 +44,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from text_vpa.data.ast_parser import ModeExtractor, SlotKind, TreeSitterASTExtractor
 from text_vpa.data.synthetic import CodeRecord
-from text_vpa.data.tokenization import TextVPATokenizer
+from text_vpa.data.tokenization import TextVPATokenizer, word_bearing_mask
 from text_vpa.models.realizers.paths import KappaSchedule, mixture_path_sample
 
 __all__ = [
@@ -321,8 +322,7 @@ class PRJEPADataset(Dataset):
         self.max_output_tokens = max_output_tokens
         self.modes = ModeExtractor(mode_scheme)
         if word_bearing is None:
-            word_bearing = [any(ch.isalpha() or ch == "_" for ch in s) and not tokenizer.is_special(i)
-                            for i, s in enumerate(tokenizer.token_strings)]
+            word_bearing = word_bearing_mask(tokenizer)
         self.word_bearing = list(word_bearing)
         builder = _ExampleBuilder(tokenizer, num_slots, max_context_tokens, max_output_tokens, max_structure_tokens,
                                   max_text_tokens, mode_scheme, skip_unparseable, self.word_bearing)
@@ -605,8 +605,11 @@ def build_dataloader(dataset: PRJEPADataset, collator: PRJEPACollator, batch_siz
     """DataLoader with length-bucketed, rank-sharded batches."""
     sampler = LengthBucketSampler(dataset.canvas_lengths(bucket_size), batch_size, shuffle, seed, drop_last,
                                   rank, world_size)
+    # Forked workers share the examples with the parent; under spawn / forkserver (Python 3.14's default on
+    # Linux) every worker would receive a pickled copy of the whole dataset.
+    fork = num_workers > 0 and sys.platform.startswith("linux") and "fork" in multiprocessing.get_all_start_methods()
     return DataLoader(dataset, batch_sampler=sampler, collate_fn=collator, num_workers=num_workers,
-                      persistent_workers=num_workers > 0)
+                      persistent_workers=num_workers > 0, multiprocessing_context="fork" if fork else None)
 
 
 def epoch_batches(loader: object, epoch: int, skip: int) -> Iterator:

@@ -863,3 +863,35 @@ def test_train_cli_max_steps_overrides_the_stage_max_steps(tmp_path) -> None:
     assert payload["step"] == 3
     assert payload["ema"]["total_steps"] == 3
     assert payload["config"]["training"]["planner"]["max_steps"] == 3
+
+
+def test_bpe_trains_on_an_evenly_spaced_sample_of_a_large_corpus(monkeypatch) -> None:
+    from text_vpa.configs.schema import TextVPAConfig
+    from text_vpa.data.synthetic import CodeRecord
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(train_cli, "train_bpe_tokenizer", lambda texts, vocab_size: seen.append(list(texts)) or "tok")
+    records = [CodeRecord(f"c{i}", f"t{i}", "python", None) for i in range(10)]
+    cfg = TextVPAConfig.model_validate({"data": {"tokenizer": "bpe", "bpe_train_records": 4}})
+    assert train_cli.make_tokenizer(cfg, records) == "tok"
+    assert seen[-1] == ["t0", "t2", "t5", "t7", "c0", "c2", "c5", "c7"]      # indices int(i * 10 / 4)
+    everything = TextVPAConfig.model_validate({"data": {"tokenizer": "bpe", "bpe_train_records": None}})
+    train_cli.make_tokenizer(everything, records)
+    assert len(seen[-1]) == 20
+    small = TextVPAConfig.model_validate({"data": {"tokenizer": "bpe", "bpe_train_records": 50}})
+    train_cli.make_tokenizer(small, records)
+    assert len(seen[-1]) == 20                                              # fewer records than the cap: all
+
+
+def test_release_records_frees_the_records_and_freezes_only_for_workers() -> None:
+    import gc
+
+    records, other = [1, 2, 3], None
+    before = gc.get_freeze_count()
+    train_cli.release_records(records, other)
+    assert records == [] and gc.get_freeze_count() == before
+    try:
+        train_cli.release_records([4], freeze=True)
+        assert gc.get_freeze_count() > 0
+    finally:
+        gc.unfreeze()

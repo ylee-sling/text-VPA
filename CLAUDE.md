@@ -27,14 +27,14 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/inference/sampler.py` | Algorithm 1 | `PRJEPASampler`, `DepthAudit` (K + 3) |
 | `text_vpa/inference/energy_terms.py` | Sec. 3.3, Prop. 4 | energies, `PrefixLexer`, Prop. 4(d) check, network-free repair |
 | `text_vpa/data/` | Table 1, Sec. 5.1 | tokenizers, tree-sitter `TreeSitterASTExtractor` + `ModeExtractor`, dataset (compact `Example`, cache, parallel build), collator, synthetic corpus |
-| `text_vpa/data/corpus.py` | Sec. 5.1 "Data" | corpus builder: permissive licenses, self-contained documented functions, AST dedup, 13-word-gram decontamination |
+| `text_vpa/data/corpus.py` | Sec. 5.1 "Data" | corpus builder: `download-shards` (every shard of a Hub dataset, filtered to permissive Python while downloading), self-contained functions (+ methods, + undocumented, documented first), AST dedup, 13-word-gram decontamination |
 | `text_vpa/evaluation/` | Sec. 5.2 | unbiased pass@k, resource-limited execution, HumanEval / MBPP tasks (`evaluate.py`), `diagnose.py` (post-run checks) |
 | `text_vpa/utils/verification.py` | Sec. 4.6, App. B | NumPy port of the paper's numerical checks (Table 2) |
 | `text_vpa/utils/profiler.py` | Sec. 5.4, App. A.2 | roofline (Table 3), measured latency, simulated AR decoder |
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
 | `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
-| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
+| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline; `CORPUS=shards` all of github-code-clean, up to 2M functions, or `export`; corpus recipe and run-corpus guards; Pass@k with and without energies), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown, outcome markers per run directory; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
 
 ## Commands
 
@@ -81,21 +81,31 @@ python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference -
   Stage-1 runs. `frobenius` with `lambda_invar=1` is Eq. 5 verbatim.
 - **Collapse guard.** srank(C) < d/2 aborts Stage 1 and writes `stage1_rejected.pt` only after
   `training.collapse_grace_steps` (random initialisations are low-rank; the paper checks per epoch).
+  `train_l4.sh` sets the grace to `STAGE1_STEPS + 1` (`COLLAPSE_GRACE`): the guard only logs. In Run 1 srank
+  rose from 12 to 125 of d = 256 over 50K steps and the planner it would have rejected trained Stage 2.
 - **Slots.** g_φ runs on all M slot queries at training and inference; the prediction term and VICReg rows
   use the reference's real slots; the bridge conditions on all M slots.
 - **Plan readout.** The paper's "slot decoder" is `PlanReadout`, trained in Stages 2–3 on the predicted plan
   (supervision, never conditioning). Energies use its decoded plan at inference, or the oracle
-  `PlanConstraints.from_reference` for evaluation.
+  `PlanConstraints.from_reference` for evaluation. The inventory head is trained with class-balanced BCE
+  (`readout.inventory_loss = balanced`: a program uses tens of the S tokens, and plain BCE licensed a third
+  of them in Run 1). Every Stage-2/3 evaluation calibrates its threshold to `readout.inventory_recall`
+  (0.95) pooled recall on the evaluation set (`InventoryCalibration`, logit grid step 0.05) and stores it in
+  the checkpoint (`calibration`); inference uses it, else `readout.inventory_threshold` (0.5; checkpoints
+  without a calibration), and `--inventory-threshold` overrides both.
 - **Energies.** `PlanVocabularyEnergy` licenses identifier-bearing *tokens* (plan inventory + keywords +
-  builtins), plan-mediated and hard. `sampler.license_context` (off by default; `--license-context` in
-  `evaluate.py` / `generate.py`) also licenses the words of the context c: c is fixed during realization,
-  so the term stays draft-independent and Prop. 4(d) holds. `--inventory-threshold` overrides
-  `readout.inventory_threshold` (0.5). `GrammarEnergy` (bracket legality outside strings/comments, incl. PEP 701
-  f-strings; [PAD] inside an open bracket or string) is hard and draft-dependent. `ArityEnergy` and
-  `TypeSignatureEnergy` are soft (5.0) and draft-dependent. The final repair is network-free: left to right
-  with the energies of the repaired prefix, it replaces hard violations, leftover [MASK]s and positions that
-  never left w_0 (stalls: a stale draft-dependent term rejected the posterior's token, Prop. 4(b)), by
-  argmax p·e^{-E/T} with p the last untilted posterior.
+  builtins + the words of the context c, `sampler.license_context`, on by default), plan-mediated. c is fixed
+  during realization, so the term stays draft-independent and Prop. 4(d) holds. It is soft:
+  `energy.identifier_weight = 2.0` (an unlicensed token keeps e^{-2/T} of its posterior), because the readout
+  misses tokens a program needs and a hard term blocked valid code in Run 1 (memorized programs: 100% exact
+  without energies, 0% with them). `.inf` restores the hard term; `--identifier-weight` and
+  `--[no-]license-context` override a checkpoint's settings in `evaluate.py` / `generate.py`. `GrammarEnergy`
+  (bracket legality outside strings/comments, incl. PEP 701 f-strings; [PAD] inside an open bracket or
+  string) is hard and draft-dependent. `ArityEnergy` and `TypeSignatureEnergy` are soft (5.0) and
+  draft-dependent. The final repair is network-free: left to right with the energies of the repaired prefix,
+  it replaces hard violations, leftover [MASK]s and positions that never left w_0 (stalls: a stale
+  draft-dependent term rejected the posterior's token, Prop. 4(b)), by argmax p·e^{-E/T} with p the last
+  untilted posterior.
 - **Source at inference.** w_0 is uniform over the plan-admissible tokens (`sampler.restrict_source`), so the
   premise of Prop. 4(d) holds from t = 0; training draws w_0 uniformly over V.
 - **Stage 2 mode.** g_φ gets the reference mode (teacher forcing) by default; the plan is still predicted
@@ -115,5 +125,14 @@ python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference -
   dense layout. Never store per-token Python lists for a corpus (~100 KB per example at M = 256).
 - **Decontamination.** Drop a training function sharing any 13-word n-gram (identifiers and numbers) with
   HumanEval / MBPP; punctuation tokens made shared signatures count as contamination.
+- **Corpus scale (Run 2).** github-code-clean holds ~0.6M self-contained documented top-level functions, so the
+  2M-function corpus also takes methods of top-level non-test classes (`Class.method`, dedented to column 0,
+  `self` stays a parameter) and undocumented functions of >= 2 statements (context = imports + signature +
+  leading comments). `--prefer-documented`: documented functions fill `--max-functions` first. Origins are
+  `repo_name/path`. The BPE trains on `data.bpe_train_records` (200K, evenly spaced) records.
+- **Loader memory.** `data=code` uses 2 DataLoader workers, forked explicitly (Python 3.14 defaults to
+  forkserver, which would pickle the dataset per worker); `train.py` frees the raw records and calls
+  `gc.freeze()` before the workers start. A forked worker still copies ~2 KB per example over an epoch
+  (reference counts), ~4 GB at 2M examples.
 - **Not implemented.** FS-DFM distillation from a 1,024-step teacher; HLS-C bit-width / directive-legality
   energies; contract energies; the continuous-control solver.

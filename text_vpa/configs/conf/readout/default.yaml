@@ -3,7 +3,9 @@ enabled: true
 hidden_dim: 256
 max_text_tokens: 48        # decoded tokens per slot text (signatures)
 length_bucket_size: 32     # the length head predicts the canvas length in buckets of this size
-inventory_threshold: 0.5   # identifier-bearing tokens with sigmoid > threshold are licensed
+inventory_threshold: 0.5   # identifier-bearing tokens with sigmoid > threshold are licensed (uncalibrated checkpoints)
+inventory_loss: balanced   # class-balanced BCE (a program uses tens of the S tokens); mean = plain BCE over B x S
+inventory_recall: 0.95     # evaluations calibrate the threshold to this recall, stored in the checkpoint; null = off
 kind_weight: 1.0
 text_weight: 1.0
 inventory_weight: 1.0

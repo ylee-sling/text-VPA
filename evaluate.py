@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 
-from text_vpa.configs.schema import RealizerConfig, SamplerConfig
+from text_vpa.configs.schema import RealizerConfig
 from text_vpa.evaluation import (
     load_humaneval_tasks,
     load_mbpp_tasks,
@@ -35,7 +35,7 @@ from text_vpa.evaluation import (
     summarize_pass_at_k,
 )
 from text_vpa.evaluation.tasks import MBPP_SPLITS, EvalTask
-from text_vpa.inference.loading import build_sampler, load_model
+from text_vpa.inference.loading import build_sampler, load_model, override_section
 from text_vpa.utils.device import resolve_device
 
 
@@ -55,10 +55,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mode-strategy", choices=("sample", "greedy", "gumbel"), default=None)
     p.add_argument("--temperature", type=float, default=None, help="energy temperature T")
     p.add_argument("--no-energy", action="store_true", help="disable the constraint energies and the repair")
-    p.add_argument("--license-context", action="store_true",
-                   help="also license the context's words in the plan-vocabulary energy (sampler.license_context)")
+    p.add_argument("--license-context", action=argparse.BooleanOptionalAction, default=None,
+                   help="license the context's words in the plan-vocabulary energy (default: the checkpoint's "
+                        "sampler.license_context)")
+    p.add_argument("--identifier-weight", type=float, default=None,
+                   help="plan-vocabulary energy of an unlicensed identifier token, e.g. 2 or inf (default: the "
+                        "checkpoint's energy.identifier_weight)")
     p.add_argument("--inventory-threshold", type=float, default=None,
-                   help="readout inventory threshold for licensed tokens (default: the checkpoint's)")
+                   help="readout inventory threshold for licensed tokens (default: the checkpoint's calibration, "
+                        "else readout.inventory_threshold)")
     p.add_argument("--limit", type=int, default=None, help="evaluate the first N problems only")
     p.add_argument("--timeout", type=float, default=10.0, help="seconds per test program")
     p.add_argument("--exec-workers", type=int, default=4, help="test programs run in parallel")
@@ -76,20 +81,22 @@ def load_tasks(args: argparse.Namespace) -> list[EvalTask]:
 def generate(args: argparse.Namespace, tasks: list[EvalTask]) -> tuple[list[list[str]], dict]:
     device = resolve_device(args.device)
     loaded = load_model(args.checkpoint, device)
+    if args.identifier_weight is not None and not args.identifier_weight > 0:
+        raise SystemExit("--identifier-weight must be positive (inf for a hard term)")
+    loaded.cfg = override_section(loaded.cfg, "energy", identifier_weight=args.identifier_weight)
+    loaded.cfg = override_section(loaded.cfg, "sampler", mode_strategy=args.mode_strategy,
+                                  license_context=args.license_context)
     cfg = loaded.cfg
     rcfg = cfg.realizer
     if args.temperature is not None:
         rcfg = RealizerConfig.model_validate({**rcfg.model_dump(), "temperature": args.temperature})
     sampler = build_sampler(loaded, use_energy=not args.no_energy)
     sampler.rcfg = rcfg
-    supdate = {k: v for k, v in (("mode_strategy", args.mode_strategy),
-                                 ("license_context", True if args.license_context else None)) if v is not None}
-    if supdate:
-        sampler.scfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), **supdate})
+    threshold, threshold_source = loaded.inventory_threshold()
     if args.inventory_threshold is not None:
         if not 0.0 < args.inventory_threshold < 1.0:
             raise SystemExit("--inventory-threshold must be in (0, 1)")
-        sampler.inventory_threshold = args.inventory_threshold
+        sampler.inventory_threshold, threshold_source = args.inventory_threshold, "--inventory-threshold"
     k_steps = args.k_steps or rcfg.num_steps
     tok = loaded.tokenizer
     samples: list[list[str]] = []
@@ -119,7 +126,8 @@ def generate(args: argparse.Namespace, tasks: list[EvalTask]) -> tuple[list[list
     info = {"checkpoint": str(args.checkpoint), "stage": loaded.stage, "step": loaded.step,
             "realizer": rcfg.kind, "k_steps": k_steps, "sequential_depth": depth, "device": str(device),
             "energy": not args.no_energy, "license_context": sampler.scfg.license_context,
-            "inventory_threshold": sampler.inventory_threshold, "generation_seconds": round(seconds, 3),
+            "identifier_weight": cfg.energy.identifier_weight, "inventory_threshold": sampler.inventory_threshold,
+            "inventory_threshold_source": threshold_source, "generation_seconds": round(seconds, 3),
             "seconds_per_problem": round(seconds / max(len(tasks), 1), 4), **stats}
     return samples, info
 

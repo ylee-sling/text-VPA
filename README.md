@@ -20,13 +20,17 @@ actions to discrete tokens.
 ## Status
 
 > [!IMPORTANT]
-> **A research prototype with equation-level verification. No trained checkpoints and no benchmark results
-> yet.** The paper's evaluation protocol (Sec. 5) has not been run. What is verified:
-> - 1,126 unit and integration tests check every equation against independent float64 references, the
+> **A research prototype with equation-level verification. No released checkpoints and no competitive
+> benchmark results yet.** The paper's evaluation protocol (Sec. 5) has not been run at the paper's scale. A
+> first L4 run on a 61K-function corpus scored 0% Pass@k: its realizer reproduces programs it trained on but
+> did not generalize, and the hard plan-vocabulary energy blocked valid code. The second run uses a
+> 2M-function corpus and a soft, calibrated energy (see "Training on a GCP L4 VM"). What is verified:
+> - 1,150 unit and integration tests check every equation against independent float64 references, the
 >   K + 3 depth, Proposition 4(d), and the Stage-2 anti-leakage invariant;
 > - the Pass@k harness passes every HumanEval reference solution (164/164) and 499/500 of MBPP's test split;
-> - `scripts/gcp/train_l4.sh` (corpus → Stage 1 → Stage 2 → Pass@k) runs end to end and resumes after an
->   interruption (checked on CPU with tiny settings; not yet run on an L4);
+> - `scripts/gcp/train_l4.sh` (corpus → Stage 1 → Stage 2 → Pass@k) runs end to end on an L4 (first run)
+>   and resumes after an interruption; the full-corpus pipeline is checked on CPU with tiny settings against
+>   a local stand-in for Hugging Face;
 > - `scripts/gcp/run_all.sh` also runs end to end on a simulated reused VM (checked on CPU): a tmux server that
 >   passes another project's `PYTHONPATH`, pip index, `PIP_USER`, uv settings and `CUDA_VISIBLE_DEVICES` on,
 >   no system Python 3.12, and a broken `.venv`;
@@ -129,10 +133,20 @@ Several specs can be combined: `--data humaneval:data/HumanEval.jsonl.gz jsonl:d
 
 ```bash
 python -m text_vpa.data.corpus download --dataset codeparrot/github-code-clean --config Python-all \
-    --out data/raw --max-files 10                     # the Hub's Parquet conversion; resumable
+    --out data/raw --max-files 10                     # the Hub's partial Parquet conversion; resumable
 python -m text_vpa.data.corpus build --source 'parquet:data/raw/*.parquet' \
     --humaneval data/eval/HumanEval.jsonl.gz --mbpp data/eval/mbpp.jsonl --out data/corpus
+
+# all of github-code-clean (880 shards, 314 GB): kept to permissive Python while downloading, ~20 GB
+python -m text_vpa.data.corpus download-shards --dataset codeparrot/github-code-clean --out data2/shards
+python -m text_vpa.data.corpus build --source 'parquet:data2/shards/*.parquet' --include-methods \
+    --allow-undocumented --prefer-documented --max-functions 2000000 \
+    --humaneval data/eval/HumanEval.jsonl.gz --mbpp data/eval/mbpp.jsonl --out data2/corpus
 ```
+
+`download-shards` fetches 8 shards at a time (`--workers`), checks each against its size and re-fetches a
+damaged one. A rerun skips finished shards. `--shards 0-99` takes a subset, and `HF_TOKEN` is sent to the Hub
+but not to the CDN its downloads redirect to.
 
 - **Sources:** `parquet:GLOB`, `jsonl:GLOB` (a `content`/`code` field and an optional license field) or
   `dir:PATH` (`*.py`, with `--assume-license`).
@@ -140,6 +154,14 @@ python -m text_vpa.data.corpus build --source 'parquet:data/raw/*.parquet' \
 - **Pairs:** every top-level function with a docstring, a real body and no reference to anything except its
   parameters, locals, builtins and module-level imports. Context = the imports it uses + signature +
   docstring (HumanEval's prompt format); target = the imports + the whole function.
+  - `--include-methods` adds methods of top-level classes other than test classes (`Class.method`, moved to
+    column 0).
+  - `--allow-undocumented` adds functions without a docstring that have at least 2 statements. Their context
+    is the imports + signature (+ comment lines before the first statement).
+  - `--prefer-documented` with `--max-functions` holds undocumented functions back until the documented
+    ones are counted.
+  - On site-packages, these options multiply the yield by 3.0 (methods), 1.8 (undocumented) and 6.9
+    (both).
 - **Deduplication:** exact, on the function's AST without its docstring.
 - **Decontamination:** a function sharing any 13-word n-gram (identifiers and numbers; formatting ignored) with
   a HumanEval or MBPP problem is dropped.
@@ -209,7 +231,7 @@ Use the Cloud Console (**Compute Engine → VM instances → Create instance**),
 | VM provisioning model | **Standard** (Spot is cheaper but can be stopped at any time) |
 | On host maintenance / automatic restart | **Terminate VM instance** (required with a GPU) / **On** |
 | Boot disk image | **Deep Learning on Linux**, the Ubuntu 24.04 version with CUDA 12.9 and NVIDIA driver 580 (image family `common-cu129-ubuntu-2404-nvidia-580`). Ubuntu 22.04 has Python 3.10, too old for the pinned requirements. |
-| Boot disk type / size | **Balanced persistent disk**, **200 GB** (image, Python environment ~10 GB, corpus and cache, checkpoints ~15 GB) |
+| Boot disk type / size | **Balanced persistent disk**, **200 GB** (image, Python environment ~10 GB, filtered shards ~20 GB, corpus and dataset cache ~15 GB, checkpoints ~15 GB) |
 | Identity and API access | Compute Engine default service account, **Allow default access**. Choose Storage **Read Write** only if you set `GCS` to back up `runs/` to a bucket. |
 | Networking | an external IPv4 address (ephemeral is fine): the run downloads from Hugging Face, PyPI and GitHub |
 | Shielded VM | leave **Secure Boot** off (the default) |
@@ -235,13 +257,20 @@ The session runs these steps in order:
 3. checks that PyTorch runs on the GPU, downloads HumanEval and MBPP, and checks the Pass@k harness on their reference solutions;
 4. runs the test suite (failures are reported, not fatal);
 5. runs the memory check, falling back to smaller micro-batches with more accumulation if needed;
-6. runs `scripts/gcp/train_l4.sh`: corpus, Stage 1 (50K steps), Stage 2 (100K steps), Pass@k on HumanEval and MBPP.
+6. runs `scripts/gcp/train_l4.sh`: corpus, Stage 1 (50K steps), Stage 2 (60K steps), Pass@k on HumanEval and MBPP.
 
 When the run ends, the VM shuts itself down (`shutdown -h +1`), after a failure too. Use `SHUTDOWN_ON_FAILURE=0`
 to keep it up. Logs, checkpoints and results stay on the boot disk. If the VM restarts unexpectedly (host
 maintenance), an `@reboot` entry restarts the run, and it resumes from the last checkpoint. `run_all.sh
 --status` shows the state; `run_all.sh --cancel` stops the run without shutting down. Times in the log are the
 VM's clock (UTC). Settings are environment variables, such as `STAGE2_STEPS=30000 bash .../run_all.sh`.
+
+Each run directory records its outcome (`runs/l4/run_all.done`, `.failed`, ...), so a finished run is not
+started again. A second run takes a new run directory, and a new data directory if its corpus differs:
+
+```bash
+RUN=runs/run2 DATA=data2 bash ~/text-VPA/scripts/gcp/run_all.sh
+```
 
 Step by step instead: `bash scripts/gcp/setup_vm.sh`, then
 `tmux new -s train 'bash scripts/gcp/train_l4.sh 2>&1 | tee -a train_l4.log'`.
@@ -289,15 +318,34 @@ What `run_all.sh` does differently on such a VM:
   work alive, start with `SHUTDOWN_ON_SUCCESS=0 SHUTDOWN_ON_FAILURE=0 bash text-VPA/scripts/gcp/run_all.sh`.
 
 `train_l4.sh` runs these steps in order:
-1. download and build the corpus;
+1. download and build the corpus (below);
 2. check memory on worst-case batches;
-3. Stage 1 (50K steps);
-4. Stage 2 (100K steps, validation loss every 2,000 steps);
-5. Pass@k on HumanEval and MBPP.
+3. Stage 1 (50K steps; the stable rank is logged, see below);
+4. Stage 2 (60K steps, validation loss and the inventory calibration every 2,000 steps);
+5. Pass@k on HumanEval and MBPP, with the constraint energies and without them (`RUN/eval/<benchmark>` and
+   `RUN/eval/<benchmark>-no-energy`).
 
 Re-running the same command after a stop skips finished steps and resumes the interrupted stage from its last
 checkpoint (every 1,000 steps). Set `GCS=gs://BUCKET/PATH` to copy `runs/` to Cloud Storage every 30 minutes.
 Every setting is a variable at the top of the script.
+
+**Corpus.** `CORPUS=shards` (the default) downloads every shard of
+[github-code-clean](https://huggingface.co/datasets/codeparrot/github-code-clean)'s main branch (880 Parquet
+files, 314 GB, all languages) with `python -m text_vpa.data.corpus download-shards`. Each shard is filtered to
+permissively licensed Python while it downloads and then deleted, so the filtered files take ~20 GB. The
+build keeps self-contained functions, methods of top-level classes (moved to column 0) and undocumented
+functions (their context is the signature). Documented functions come first and fill `MAX_FUNCTIONS`
+(2,000,000); undocumented ones fill what is left. `SHARDS=0-99` takes a tenth of the shards. `CORPUS=export`
+is Run 1's smaller corpus: 10 files of the dataset's partial Parquet export, documented top-level functions
+only (61K functions). A corpus directory records its recipe (`DATA/corpus/recipe`), and a run directory its
+corpus (`RUN/corpus`). A different recipe for an existing `DATA`, or another corpus for a run with
+checkpoints, is refused.
+
+**Stable-rank guard.** The paper rejects a Stage-1 planner whose stable rank is below d/2. In Run 1 it rose
+from 12 to 125 (d = 256) over 50K steps, so the guard would have rejected a planner that was still improving.
+`train_l4.sh` sets `training.collapse_grace_steps` to `STAGE1_STEPS + 1`: the stable rank is logged every 1,000
+steps and printed after Stage 1, but it does not stop the run. `COLLAPSE_GRACE=N` lets the guard reject from
+step N.
 
 ## Evaluation (Pass@k)
 
@@ -307,10 +355,14 @@ python evaluate.py --benchmark humaneval --data data/eval/HumanEval.jsonl.gz \
 python evaluate.py --benchmark mbpp --data data/eval/mbpp.jsonl --reference --out runs/eval/mbpp-reference
 ```
 
-`--no-energy` turns the constraint energies off. `--license-context` also licenses the context's words in
-the plan-vocabulary energy, and `--inventory-threshold` sets the readout's licensing threshold (default
-0.5). Without `--license-context`, only the readout's predicted token inventory, keywords and builtins are
-licensed, so the prompt's own names and docstring words can be forbidden.
+`--no-energy` turns the constraint energies off. The plan-vocabulary energy licenses the readout's predicted
+token inventory, keywords, builtins and the context's words. It is soft: an unlicensed identifier token keeps
+e^{-2/T} of its probability (`energy.identifier_weight = 2.0`). A hard energy blocked valid code in Run 1,
+because the readout licensed a third of the tokens a program needs. The readout's threshold is calibrated at
+every Stage-2 evaluation to license 95% of the validation programs' identifier tokens, and the checkpoint
+stores it. These flags override a checkpoint's settings: `--[no-]license-context`, `--identifier-weight W`
+(`inf` = hard), and `--inventory-threshold P`. Checkpoints trained before these defaults keep their own
+settings (a hard energy without the context's words, threshold 0.5).
 
 After a run, `python -m text_vpa.evaluation.diagnose` reports which checkpoint was scored (every Stage-2
 validation loss and the step in `best_stage2.pt`), prints HumanEval completions with their errors, and
@@ -371,9 +423,11 @@ These are recorded in [`CLAUDE.md`](CLAUDE.md). The most consequential:
 - **Plan readout.** The paper's "slot decoder" is `PlanReadout`, trained in Stage 2 on the predicted plan. It
   decodes slot kinds, signatures, a token inventory and the output length from Z_target, which is what the
   energies need at inference.
-- **Energy terms.** Only identifier licensing is plan-mediated (and hard), so only it carries
-  Prop. 4(d)'s guarantee under parallel updates. Grammar (hard), argument-count and type-annotation (soft)
-  terms read the draft prefix. A network-free left-to-right repair enforces the hard ones at the end.
+- **Energy terms.** Only identifier licensing is plan-mediated, so only it carries Prop. 4(d)'s guarantee
+  under parallel updates. It licenses the readout's token inventory, keywords, builtins and the context's
+  words. It is soft by default (`energy.identifier_weight = 2.0`; `.inf` = hard), and the readout's threshold is
+  calibrated to 95% recall at every Stage-2 evaluation. Grammar (hard), argument-count and type-annotation
+  (soft) terms read the draft prefix. A network-free left-to-right repair enforces the hard ones at the end.
 - **Repair of stalls.** A draft-dependent term evaluated on a noisy prefix can reject the token the posterior
   wants (for example [PAD] after a noise token that opened a bracket). The rejected mass becomes probability of
   staying (Prop. 4(b)), so after the last step such a position can still hold its source token. The repair

@@ -758,7 +758,7 @@ def test_license_context_adds_the_context_words_to_the_decoded_plans(tiny_config
     row = list(b"def f(xs_q):")[:M_C]
     context = torch.tensor([row + [ord(" ")] * (M_C - len(row))] * B)
     words = {t for t in row if _word_bearing(t)}
-    plain = PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(), energy, extractor).sample(
+    plain = PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(license_context=False), energy, extractor).sample(
         context, length=N, num_steps=2, generator=_gen(16))
     licensed = PRJEPASampler(model, TOK, cfg.realizer, SamplerConfig(license_context=True), energy,
                              extractor).sample(context, length=N, num_steps=2, generator=_gen(16))

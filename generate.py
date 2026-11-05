@@ -20,7 +20,7 @@ import torch
 
 from text_vpa.configs.schema import RealizerConfig, SamplerConfig
 from text_vpa.data.ast_parser import ModeExtractor
-from text_vpa.inference.loading import build_sampler, load_model
+from text_vpa.inference.loading import build_sampler, load_model, override_section
 from text_vpa.utils.device import resolve_device
 
 
@@ -38,10 +38,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--guidance", type=float, default=None, help="predictor-free guidance scale omega")
     p.add_argument("--mode-strategy", choices=("sample", "greedy", "gumbel"), default=None)
     p.add_argument("--no-energy", action="store_true", help="disable the constraint energies and the repair")
-    p.add_argument("--license-context", action="store_true",
-                   help="also license the context's words in the plan-vocabulary energy (sampler.license_context)")
+    p.add_argument("--license-context", action=argparse.BooleanOptionalAction, default=None,
+                   help="license the context's words in the plan-vocabulary energy (default: the checkpoint's "
+                        "sampler.license_context)")
+    p.add_argument("--identifier-weight", type=float, default=None,
+                   help="plan-vocabulary energy of an unlicensed identifier token, e.g. 2 or inf (default: the "
+                        "checkpoint's energy.identifier_weight)")
     p.add_argument("--inventory-threshold", type=float, default=None,
-                   help="readout inventory threshold for licensed tokens (default: the checkpoint's)")
+                   help="readout inventory threshold for licensed tokens (default: the checkpoint's calibration, "
+                        "else readout.inventory_threshold)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto")
     return p.parse_args(argv)
@@ -51,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     device = resolve_device(args.device)
     loaded = load_model(args.checkpoint, device)
+    if args.identifier_weight is not None and not args.identifier_weight > 0:
+        print("error: --identifier-weight must be positive (inf for a hard term)", file=sys.stderr)
+        return 2
+    loaded.cfg = override_section(loaded.cfg, "energy", identifier_weight=args.identifier_weight)
     cfg = loaded.cfg
     if args.realizer is not None and args.realizer != cfg.realizer.kind:
         print(f"error: the checkpoint was trained with the {cfg.realizer.kind} realizer, not {args.realizer}",
@@ -61,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     realizer_cfg = RealizerConfig.model_validate({**cfg.realizer.model_dump(), **rupdate})
     sampler_cfg = cfg.sampler
     supdate = {k: v for k, v in (("mode_strategy", args.mode_strategy),
-                                 ("license_context", True if args.license_context else None)) if v is not None}
+                                 ("license_context", args.license_context)) if v is not None}
     if supdate:
         sampler_cfg = SamplerConfig.model_validate({**cfg.sampler.model_dump(), **supdate})
     sampler = build_sampler(loaded, use_energy=not args.no_energy)

@@ -282,14 +282,22 @@ def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
                               "--k", "1", "--k-steps", "2", "--device", "cpu",
                               "--out", str(run / "eval" / "humaneval")]) == 0
     summary = json.loads((run / "eval" / "humaneval" / "summary.json").read_text())
-    assert summary["license_context"] is False and summary["inventory_threshold"] == 0.5     # the defaults
+    # the defaults: context licensed, soft vocabulary energy, the threshold calibrated at the best evaluation
+    from text_vpa.engine.runtime import load_checkpoint
+
+    calibration = load_checkpoint(run / "stage2" / "best_stage2.pt")["calibration"]
+    assert calibration["target_recall"] == 0.95 and calibration["recall"] >= 0.95
+    assert summary["license_context"] is True and summary["identifier_weight"] == 2.0
+    assert summary["inventory_threshold"] == calibration["inventory_threshold"]
+    assert summary["inventory_threshold_source"] == "calibrated for recall 0.95"
     assert evaluate_cli.main(["--benchmark", "humaneval", "--data", str(data / "eval" / "HumanEval.jsonl.gz"),
                               "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--num-samples", "1",
                               "--k", "1", "--k-steps", "2", "--device", "cpu", "--limit", "1",
-                              "--license-context", "--inventory-threshold", "0.3",
+                              "--no-license-context", "--identifier-weight", "inf", "--inventory-threshold", "0.3",
                               "--out", str(tmp_path / "eval-licensed")]) == 0
     licensed = json.loads((tmp_path / "eval-licensed" / "summary.json").read_text())
-    assert licensed["license_context"] is True and licensed["inventory_threshold"] == 0.3
+    assert licensed["license_context"] is False and licensed["identifier_weight"] == float("inf")
+    assert licensed["inventory_threshold"] == 0.3 and licensed["inventory_threshold_source"] == "--inventory-threshold"
     with pytest.raises(SystemExit):
         evaluate_cli.main(["--benchmark", "humaneval", "--data", str(data / "eval" / "HumanEval.jsonl.gz"),
                            "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--inventory-threshold", "1.5",
@@ -307,7 +315,8 @@ def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
     assert f"best_stage2.pt holds step {best}" in out and "minimum" in out
     assert "4 completions:" in out and "the prompt asks for add()" in out
     assert out.count("as evaluated") >= 3 and "validation contexts (unseen): 3 examples, K = 2" in out
-    assert out.count("context licensed") >= 2 and "plan-vocabulary energy: the readout licenses" in out
+    assert out.count("context licensed") >= 2 and "plan-vocabulary energy (weight 2, inventory threshold" in out
+    assert "calibrated for recall 0.95; context licensed: True): the readout licenses" in out
     assert out.count("training conditions") >= 2
     assert "== Reading" in out
 
@@ -316,3 +325,22 @@ def load_checkpoint_step(path) -> int:
     from text_vpa.engine.runtime import load_checkpoint
 
     return int(load_checkpoint(path)["step"])
+
+
+def test_inference_threshold_comes_from_the_checkpoint_calibration_unless_disabled() -> None:
+    from text_vpa.configs.schema import TextVPAConfig
+    from text_vpa.inference.loading import LoadedModel, override_section
+
+    cfg = TextVPAConfig()
+    calibrated = {"inventory_threshold": 0.125, "target_recall": 0.95, "recall": 0.951}
+    assert LoadedModel(cfg, None, None, 2, 0, calibrated).inventory_threshold() == (
+        0.125, "calibrated for recall 0.95")
+    assert LoadedModel(cfg, None, None, 2, 0, None).inventory_threshold() == (0.5, "config")   # an older checkpoint
+    off = override_section(cfg, "readout", inventory_recall=None)
+    assert off is cfg                                       # None means "no override"
+    off = TextVPAConfig.model_validate({**cfg.model_dump(), "readout": {**cfg.readout.model_dump(),
+                                                                         "inventory_recall": None}})
+    assert LoadedModel(off, None, None, 2, 0, calibrated).inventory_threshold() == (0.5, "config")
+    hard = override_section(cfg, "energy", identifier_weight=float("inf"))
+    assert hard.energy.identifier_weight == float("inf") and cfg.energy.identifier_weight == 2.0
+    assert cfg.sampler.license_context is True                                  # the defaults of Run 2

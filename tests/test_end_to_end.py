@@ -42,6 +42,8 @@ OVERRIDES = [
     "planner=tiny", "realizer=tiny", "data=tiny", "data.tokenizer=bpe", "training.batch_size=8",
     "training.collapse_check_every=5", "training.collapse_grace_steps=1000", "training.log_every=5",
     "training.save_every=100000", "training.planner.warmup_steps=2", "training.realizer.warmup_steps=2",
+    # the hard plan-vocabulary energy (the default is soft): the oracle plan's licensing is then exact
+    "energy.identifier_weight=inf",
 ]
 
 

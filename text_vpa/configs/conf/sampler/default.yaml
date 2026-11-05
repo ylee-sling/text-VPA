@@ -7,4 +7,4 @@ check_admissibility: true  # assert Prop. 4(d) at every parallel update
 audit_depth: true          # assert exactly K + 3 sequential network evaluations
 repair_aware: false
 default_length: null       # null: canvas length from the readout's length head
-license_context: false     # true: the context's words are licensed too (plan inventory + keywords + builtins + c)
+license_context: true      # the context's words are licensed too (plan inventory + keywords + builtins + c)

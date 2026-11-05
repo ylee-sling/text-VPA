@@ -33,6 +33,7 @@ built examples so later stages and resumed runs load them instead of rebuilding.
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import logging
 import os
@@ -120,8 +121,25 @@ def make_tokenizer(cfg: TextVPAConfig, records: list[CodeRecord]) -> TextVPAToke
         if not cfg.data.tokenizer_name:
             raise SystemExit("data.tokenizer=hf needs data.tokenizer_name")
         return HFTokenizer.from_pretrained(cfg.data.tokenizer_name)
+    cap = cfg.data.bpe_train_records
+    if cap is not None and len(records) > cap:
+        step = len(records) / cap                         # evenly spaced: every shard contributes
+        records = [records[int(i * step)] for i in range(cap)]
+        logger.info("training the BPE on %d of the records (data.bpe_train_records)", cap)
     texts = [r.target for r in records] + [r.context for r in records]
     return train_bpe_tokenizer(texts, vocab_size=cfg.data.bpe_vocab_size)
+
+
+def release_records(*lists: list | None, freeze: bool = False) -> None:
+    """Free the raw records once the datasets are built. ``freeze`` (DataLoader workers) also moves the
+    long-lived objects (the examples) out of the cyclic garbage collector's reach: the workers are forked, and a
+    collection that touches every object would copy the parent's memory into each of them (copy-on-write)."""
+    for records in lists:
+        if records is not None:
+            records.clear()
+    gc.collect()
+    if freeze:
+        gc.freeze()
 
 
 STAGE_KEYS = {1: "planner", 2: "realizer", 3: "joint"}
@@ -214,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             planner = TextVPAPlanner.from_config(cfg.planner)
             loader = build_loader(cfg, records, tokenizer, ctx, corruption=False, shuffle=True, drop_last=True,
                                   **cache)
+            release_records(records, eval_records, freeze=cfg.data.num_workers > 0)
             metric_logger = MetricLogger(out_dir, ctx.is_main, args.wandb_project, args.run_name,
                                          cfg.model_dump(mode="json"))
             trainer = Stage1Trainer(cfg, planner, tokenizer, loader, out_dir, ctx, metric_logger)
@@ -235,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         eval_loader = (build_loader(cfg, eval_records, tokenizer, ctx, corruption=True, shuffle=False, drop_last=False,
                                     **cache)
                        if eval_records else None)
+        release_records(records, eval_records, freeze=cfg.data.num_workers > 0)
         metric_logger = MetricLogger(out_dir, ctx.is_main, args.wandb_project, args.run_name,
                                      cfg.model_dump(mode="json"))
         if args.stage == 2:
@@ -260,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"best {result2.best_checkpoint}")
         return 0
     finally:
+        gc.unfreeze()
         ctx.shutdown()
 
 

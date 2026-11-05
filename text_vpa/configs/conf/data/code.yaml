@@ -9,4 +9,6 @@ max_output_tokens: 512
 max_structure_tokens: 1024
 bucket_size: 32
 time_sampling: grid
-num_workers: 4             # collation workers (the dataset itself is built once, see --build-workers)
+num_workers: 2             # collation workers (the dataset is built once, see --build-workers). Each forked worker
+                           # copies ~2 KB per example over an epoch (reference counts), 4 GB at 2M functions;
+                           # two keep up with the L4 (Stage 1 needs ~16 micro-batches/s, one worker gives ~40)

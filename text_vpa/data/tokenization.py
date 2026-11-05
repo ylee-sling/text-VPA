@@ -41,6 +41,7 @@ __all__ = [
     "TextVPATokenizer",
     "tokenizer_from_spec",
     "train_bpe_tokenizer",
+    "word_bearing_mask",
 ]
 
 #: Slot kinds with a delimiter token, in ``SlotKind`` order (1..6; EMPTY has none).
@@ -262,6 +263,13 @@ def train_bpe_tokenizer(texts: Iterable[str], vocab_size: int = 1024, min_freque
     )
     tok.train_from_iterator(texts, trainer=trainer)
     return HFTokenizer.from_json(tok.to_str())
+
+
+def word_bearing_mask(tokenizer: TextVPATokenizer) -> list[bool]:
+    """[S]: the token contains an identifier character (a letter or '_') and is not special. These are the
+    readout's inventory targets and the tokens ``PlanVocabularyEnergy`` licenses or penalises."""
+    return [any(ch.isalpha() or ch == "_" for ch in s) and not tokenizer.is_special(i)
+            for i, s in enumerate(tokenizer.token_strings)]
 
 
 def tokenizer_from_spec(spec: dict[str, Any]) -> TextVPATokenizer:

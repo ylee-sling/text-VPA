@@ -23,7 +23,7 @@ from text_vpa.inference.energy_terms import ConstraintEnergyEvaluator
 from text_vpa.inference.sampler import PRJEPASampler
 from text_vpa.models.text_vpa_model import TextVPAModel
 
-__all__ = ["LoadedModel", "build_energy", "build_sampler", "load_model"]
+__all__ = ["LoadedModel", "build_energy", "build_sampler", "load_model", "override_section"]
 
 
 @dataclass
@@ -33,6 +33,15 @@ class LoadedModel:
     model: TextVPAModel
     stage: int
     step: int
+    calibration: dict | None = None      # the inventory threshold calibrated at the checkpoint's evaluation
+
+    def inventory_threshold(self) -> tuple[float, str]:
+        """The readout's inventory threshold and where it comes from: the checkpoint's calibration (when
+        ``readout.inventory_recall`` is set and the checkpoint holds one) or ``readout.inventory_threshold``."""
+        cal = self.calibration or {}
+        if self.cfg.readout.inventory_recall is not None and cal.get("inventory_threshold"):
+            return float(cal["inventory_threshold"]), f"calibrated for recall {cal.get('target_recall')}"
+        return self.cfg.readout.inventory_threshold, "config"
 
 
 def load_model(path: str | Path, device: torch.device | str = "cpu") -> LoadedModel:
@@ -54,7 +63,17 @@ def load_model(path: str | Path, device: torch.device | str = "cpu") -> LoadedMo
             raise ValueError("the config enables the readout but the checkpoint has none")
         model.readout.load_state_dict(state["readout"])
     model.to(device).eval()
-    return LoadedModel(cfg, tokenizer, model, int(state["stage"]), int(state["step"]))
+    return LoadedModel(cfg, tokenizer, model, int(state["stage"]), int(state["step"]), state.get("calibration"))
+
+
+def override_section(cfg: TextVPAConfig, section: str, **updates: object) -> TextVPAConfig:
+    """``cfg`` with the fields ``updates`` (those not None) of one section replaced, validated again."""
+    updates = {k: v for k, v in updates.items() if v is not None}
+    if not updates:
+        return cfg
+    raw = cfg.model_dump()
+    raw[section] = {**raw[section], **updates}
+    return TextVPAConfig.model_validate(raw)
 
 
 def build_energy(cfg: TextVPAConfig, tokenizer: TextVPATokenizer) -> ConstraintEnergyEvaluator | None:
@@ -77,4 +96,4 @@ def build_sampler(loaded: LoadedModel, energy: ConstraintEnergyEvaluator | None 
         energy = build_energy(cfg, loaded.tokenizer)
     plan_source = "readout" if cfg.energy.plan_source == "readout" else "none"
     return PRJEPASampler(loaded.model, loaded.tokenizer, cfg.realizer, cfg.sampler, energy if use_energy else None,
-                         TreeSitterASTExtractor(cfg.data.language), cfg.readout.inventory_threshold, plan_source)
+                         TreeSitterASTExtractor(cfg.data.language), loaded.inventory_threshold()[0], plan_source)

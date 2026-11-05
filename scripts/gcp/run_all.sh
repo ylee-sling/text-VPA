@@ -19,7 +19,8 @@
 #   5. memory check on worst-case batches; if the L4 preset does not fit, smaller micro-batches with more
 #      accumulation (same effective batch, 64) are tried
 #   6. scripts/gcp/train_l4.sh: corpus -> Stage 1 -> Stage 2 -> Pass@k on HumanEval and MBPP (resumable;
-#      retried up to TRAIN_ATTEMPTS times; a Stage-1 collapse rejection is not retried)
+#      retried up to TRAIN_ATTEMPTS times; a Stage-1 collapse rejection is not retried). The default corpus is
+#      all of github-code-clean, filtered to permissive Python while downloading (up to 2M functions)
 #   7. shutdown -h +1 (cancel within the minute: sudo shutdown -c) after success -- and also after a failure,
 #      unless SHUTDOWN_ON_FAILURE=0. Logs, checkpoints and results stay on the boot disk.
 # If the VM restarts unexpectedly (e.g. host maintenance with automatic restart), an @reboot cron entry starts
@@ -27,6 +28,10 @@
 #
 #   bash ~/text-VPA/scripts/gcp/run_all.sh --status   # running or not, outcome markers, last log lines
 #   bash ~/text-VPA/scripts/gcp/run_all.sh --cancel   # stop the run without shutting down; no restart on boot
+#
+# Each run directory (RUN, default runs/l4) records its own outcome (RUN/run_all.done, .failed, ...): a finished
+# run is not started again, and another run takes a new RUN (and a new DATA for another corpus), e.g.
+#   RUN=runs/run2 DATA=data2 bash ~/text-VPA/scripts/gcp/run_all.sh
 #
 # A VM reused from another project: check it first with scripts/gcp/preflight.sh (read-only). The run itself
 # - uses its own .venv (recreated if it is broken or older than Python 3.12); without a system Python >= 3.12
@@ -37,11 +42,11 @@
 #   launching shell's CUDA_VISIBLE_DEVICES (set or unset) is the one the run gets;
 # - installs PyTorch's CUDA 13.0 build (PyPI) for NVIDIA driver 580 or newer, its CUDA 12.6 build for 525-579.
 #
-# Settings (environment variables, saved for restarts): everything train_l4.sh reads (STAGE1_STEPS [50000],
-# STAGE2_STEPS [100000], NUM_SAMPLES [10], GCS, HF_FILES, ...), and SHUTDOWN_ON_SUCCESS [1],
-# SHUTDOWN_ON_FAILURE [1], SHUTDOWN_DELAY_MIN [1], RUN_TESTS [1], TRAIN_ATTEMPTS [3], PYTHON [auto: the
-# interpreter for a new .venv, a path or "uv" for the standalone one], TORCH_INDEX_URL [by driver],
-# KEEP_ENV [0], UV_VERSION [0.13.2].
+# Settings (environment variables, saved for restarts): everything train_l4.sh reads (CORPUS [shards],
+# MAX_FUNCTIONS [2000000], STAGE1_STEPS [50000], STAGE2_STEPS [60000], NUM_SAMPLES [10], GCS, ...), and
+# SHUTDOWN_ON_SUCCESS [1], SHUTDOWN_ON_FAILURE [1], SHUTDOWN_DELAY_MIN [1], RUN_TESTS [1], TRAIN_ATTEMPTS [3],
+# PYTHON [auto: the interpreter for a new .venv, a path or "uv" for the standalone one], TORCH_INDEX_URL
+# [by driver], KEEP_ENV [0], UV_VERSION [0.13.2].
 set -Eeuo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -51,13 +56,35 @@ STATE="$ROOT/runs"
 LOG_DIR="$STATE/logs"
 ENV_FILE="$STATE/run_all.env"
 CRON_TAG="# text-vpa-run-all"
-SAVED_VARS=(RUN DATA HF_DATASET HF_CONFIG HF_FILES HF_TOKEN CORPUS_SOURCE CORPUS_LICENSE PRESET STAGE2_PRESET
-  STAGE1_STEPS STAGE2_STEPS EVAL_EVERY NUM_SAMPLES EVAL_LIMIT DEVICE GCS SYNC_MINUTES SHUTDOWN_ON_SUCCESS
-  SHUTDOWN_ON_FAILURE SHUTDOWN_DELAY_MIN NO_SHUTDOWN RUN_TESTS TRAIN_ATTEMPTS SKIP_GPU_CHECK SKIP_APT SESSION
-  MIN_FREE_GB PYTHON TORCH_INDEX_URL KEEP_ENV UV_VERSION)
+SAVED_VARS=(RUN DATA CORPUS MAX_FUNCTIONS SHARDS DOWNLOAD_WORKERS HF_DATASET HF_CONFIG HF_FILES HF_TOKEN HF_ENDPOINT
+  CORPUS_SOURCE CORPUS_LICENSE PRESET STAGE2_PRESET STAGE1_STEPS STAGE2_STEPS COLLAPSE_GRACE EVAL_EVERY NUM_SAMPLES
+  EVAL_LIMIT EVAL_VARIANTS DEVICE GCS SYNC_MINUTES SHUTDOWN_ON_SUCCESS SHUTDOWN_ON_FAILURE SHUTDOWN_DELAY_MIN
+  NO_SHUTDOWN RUN_TESTS TRAIN_ATTEMPTS SKIP_GPU_CHECK SKIP_APT SESSION MIN_FREE_GB PYTHON TORCH_INDEX_URL KEEP_ENV
+  UV_VERSION)
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "error: $*" >&2; exit 1; }
+
+# The run directory of this launch: RUN, else the one saved for restarts, else runs/l4.
+run_dir() {
+  local run="${RUN:-}"
+  if [[ -z "$run" && -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC2016
+    run="$(bash -c 'source "$1" >/dev/null 2>&1; echo "${RUN:-}"' _ "$ENV_FILE")"
+  fi
+  run="${run:-runs/l4}"
+  if [[ "$run" == /* ]]; then echo "$run"; else echo "$ROOT/$run"; fi
+}
+
+# Outcome markers used to live in runs/ for the only run directory of the time, runs/l4.
+migrate_markers() {
+  local m
+  for m in "done" failed interrupted; do
+    if [[ -f "$STATE/run_all.$m" && -d "$STATE/l4" && ! -e "$STATE/l4/run_all.$m" ]]; then
+      mv "$STATE/run_all.$m" "$STATE/l4/run_all.$m"
+    fi
+  done
+}
 
 # ---------------------------------------------------------------------------------------------
 # @reboot entry: relaunch after an unexpected restart (removed whenever the run ends)
@@ -79,22 +106,27 @@ cron_remove() {
 # Launcher (returns immediately)
 # ---------------------------------------------------------------------------------------------
 launch() {
-  local from_reboot=$1
+  local from_reboot=$1 run_abs
   mkdir -p "$LOG_DIR"
-  if [[ -f "$STATE/run_all.done" ]]; then
-    log "a run already finished ($(cat "$STATE/run_all.done")); results in ${RUN:-runs/l4}/eval"
-    log "to start over: rm -rf $STATE/l4 $STATE/run_all.*"
+  migrate_markers
+  if [[ $from_reboot -eq 1 ]]; then
+    [[ -f "$ENV_FILE" ]] || { cron_remove; return 0; }
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+  fi
+  run_abs="$(run_dir)"
+  if [[ -f "$run_abs/run_all.done" ]]; then
+    log "this run already finished ($(cat "$run_abs/run_all.done")); results in $run_abs/eval"
+    log "another run takes a new directory, e.g. RUN=runs/run2 DATA=data2 bash $SELF; to redo it: rm -rf $run_abs"
     cron_remove
     return 0
   fi
   if [[ $from_reboot -eq 1 ]]; then
-    if [[ ! -f "$ENV_FILE" || -f "$STATE/run_all.failed" || -f "$STATE/run_all.interrupted" ]]; then
+    if [[ -f "$run_abs/run_all.failed" || -f "$run_abs/run_all.interrupted" ]]; then
       cron_remove                                           # the run has ended: never relaunch it
       return 0
     fi
     log "restart detected: resuming the run"
-    # shellcheck disable=SC1090
-    source "$ENV_FILE"
   fi
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     log "already running: tmux attach -t $SESSION   (log: $LOG_DIR/latest.log)"
@@ -111,7 +143,7 @@ launch() {
   avail="$(df --output=avail -BG "$ROOT" | tail -1 | tr -dc '0-9')"
   [[ "$avail" -ge "${MIN_FREE_GB:-60}" ]] || die "only ${avail} GB free on the boot disk; 150 GB or more is recommended"
   if [[ $from_reboot -eq 0 ]]; then
-    rm -f "$STATE/run_all.failed" "$STATE/run_all.interrupted" "$STATE/run_all.cancel"
+    rm -f "$run_abs/run_all.failed" "$run_abs/run_all.interrupted" "$run_abs/run_all.cancel"
     : > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
     local name
@@ -131,7 +163,7 @@ launch() {
   ln -sfn "$(basename "$logfile")" "$LOG_DIR/latest.log"
   tmux new-session -d -s "$SESSION" "/bin/bash $(printf '%q' "$SELF") --worker 2>&1 | tee -i -a $(printf '%q' "$logfile")"
   cron_install
-  log "started in tmux session '$SESSION' at $(hostname)"
+  log "started in tmux session '$SESSION' at $(hostname): run directory $run_abs"
   echo "  log:     $logfile"
   echo "  watch:   tail -f $LOG_DIR/latest.log      (or: tmux attach -t $SESSION, then Ctrl-b d to detach)"
   echo "  status:  bash $SELF --status"
@@ -177,19 +209,20 @@ finish() {
     exit "$rc"
   fi
   cron_remove
-  if [[ -f "$STATE/run_all.cancel" ]]; then
-    rm -f "$STATE/run_all.cancel"
-    echo "cancelled $(date '+%F %T')" > "$STATE/run_all.interrupted"
+  mkdir -p "$RUN_ABS"
+  if [[ -f "$RUN_ABS/run_all.cancel" ]]; then
+    rm -f "$RUN_ABS/run_all.cancel"
+    echo "cancelled $(date '+%F %T')" > "$RUN_ABS/run_all.interrupted"
     log "cancelled with --cancel; not shutting down"
   elif [[ $rc -eq 0 ]]; then
-    echo "$(date '+%F %T') after $(( (SECONDS + 59) / 60 )) min" > "$STATE/run_all.done"
+    echo "$(date '+%F %T') after $(( (SECONDS + 59) / 60 )) min" > "$RUN_ABS/run_all.done"
     log "SUCCESS: the whole pipeline finished; results in $RUN_ABS/eval"
     maybe_shutdown "${SHUTDOWN_ON_SUCCESS:-1}" "success"
   elif [[ $rc -eq 129 || $rc -eq 130 ]]; then
-    echo "interrupted (exit $rc) $(date '+%F %T')" > "$STATE/run_all.interrupted"
+    echo "interrupted (exit $rc) $(date '+%F %T')" > "$RUN_ABS/run_all.interrupted"
     log "interrupted (exit $rc); not shutting down"
   else
-    echo "failed (exit $rc) $(date '+%F %T')" > "$STATE/run_all.failed"
+    echo "failed (exit $rc) $(date '+%F %T')" > "$RUN_ABS/run_all.failed"
     log "FAILED (exit $rc); see this log. Checkpoints are kept: re-run the same command to resume."
     maybe_shutdown "${SHUTDOWN_ON_FAILURE:-1}" "failure"
   fi
@@ -427,7 +460,7 @@ step_memory() {
     [[ $ok -eq 1 ]] || die "no micro-batch size fits the GPU; see the memory check output above"
   fi
   cat "$json"
-  python - "$json" "${STAGE1_STEPS:-50000}" "${STAGE2_STEPS:-100000}" <<'EOF'
+  python - "$json" "${STAGE1_STEPS:-50000}" "${STAGE2_STEPS:-60000}" <<'EOF'
 import json, sys
 report = json.load(open(sys.argv[1]))
 steps = {1: int(sys.argv[2]), 2: int(sys.argv[3])}
@@ -481,7 +514,8 @@ worker() {
   trap 'finish 129' HUP
   trap 'finish 143' TERM
   log "text-VPA unattended run on $(hostname): commit $(git -C "$ROOT" log -1 --format='%h %s' 2>/dev/null || echo unknown)"
-  log "settings: STAGE1_STEPS=${STAGE1_STEPS:-50000} STAGE2_STEPS=${STAGE2_STEPS:-100000} NUM_SAMPLES=${NUM_SAMPLES:-10} RUN=$RUN" \
+  log "settings: RUN=$RUN DATA=$DATA CORPUS=${CORPUS:-shards} MAX_FUNCTIONS=${MAX_FUNCTIONS:-2000000}" \
+    "STAGE1_STEPS=${STAGE1_STEPS:-50000} STAGE2_STEPS=${STAGE2_STEPS:-60000} NUM_SAMPLES=${NUM_SAMPLES:-10}" \
     "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>}"
   step_gpu
   step_system
@@ -496,10 +530,16 @@ worker() {
 # Status and cancel
 # ---------------------------------------------------------------------------------------------
 status() {
+  migrate_markers
+  local m run_abs f
+  run_abs="$(run_dir)"
   if tmux has-session -t "$SESSION" 2>/dev/null; then echo "running: tmux attach -t $SESSION"; else echo "not running"; fi
-  local m
+  echo "run directory: $run_abs"
   for m in "done" failed interrupted; do
-    [[ -f "$STATE/run_all.$m" ]] && echo "$m: $(cat "$STATE/run_all.$m")"
+    [[ -f "$run_abs/run_all.$m" ]] && echo "$m: $(cat "$run_abs/run_all.$m")"
+  done
+  for f in "$STATE"/*/run_all.done "$STATE"/*/run_all.failed "$STATE"/*/run_all.interrupted; do
+    [[ -f "$f" && "$(dirname "$f")" != "$run_abs" ]] && echo "other run $(dirname "$f"): ${f##*.} ($(cat "$f"))"
   done
   if crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then echo "resume after an unexpected restart: on"; fi
   if [[ -e "$LOG_DIR/latest.log" ]]; then
@@ -509,8 +549,10 @@ status() {
 }
 
 cancel() {
-  mkdir -p "$STATE"
-  touch "$STATE/run_all.cancel"
+  local run_abs
+  run_abs="$(run_dir)"
+  mkdir -p "$run_abs"
+  touch "$run_abs/run_all.cancel"
   cron_remove
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux send-keys -t "$SESSION" C-c
@@ -518,7 +560,7 @@ cancel() {
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     echo "cancelled; the VM keeps running. Re-run the start command to resume from the last checkpoint."
   else
-    rm -f "$STATE/run_all.cancel"
+    rm -f "$run_abs/run_all.cancel"
     echo "no run in progress"
   fi
 }
@@ -529,6 +571,6 @@ case "${1:-}" in
   --worker) worker ;;
   --status) status ;;
   --cancel) cancel ;;
-  -h|--help) sed -n '5,44p' "$SELF" ;;
+  -h|--help) sed -n '5,49p' "$SELF" ;;
   *) echo "unknown argument: $1 (use --status, --cancel or no argument)" >&2; exit 2 ;;
 esac
