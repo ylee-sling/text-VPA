@@ -316,6 +316,8 @@ After a run, `python -m text_vpa.evaluation.diagnose` reports which checkpoint w
 validation loss and the step in `best_stage2.pt`), prints HumanEval completions with their errors, and
 generates from training and validation contexts with and without the energies and with the reference
 canvas length. That separates a model that memorized its corpus from a sampling problem.
+`scripts/gcp/overfit_check.sh` trains Stage 2 on a few hundred training functions only (about an hour on an
+L4) and runs the diagnostic on them: a realizer that cannot memorize them cannot be fixed with more data.
 
 - **Sampling:** every problem gets n samples from Algorithm 1, with the context the training loaders build.
 - **Programs run:**

@@ -10,7 +10,8 @@
    their own, and how many define the function the prompt asks for.
 3. Generation from corpus contexts with ``best_stage2.pt``: training contexts (seen in Stage 2) and validation
    contexts (unseen), each as evaluated (energies on, canvas length from the readout), without the energies,
-   and with the reference canvas length. A model that reproduces its training targets but not unseen ones does
+   with the reference canvas length, with the context's words licensed, and under Stage 2's training
+   conditions (no energies, the reference length and the reference mode, as in teacher-forced training). A model that reproduces its training targets but not unseen ones does
    not generalize (too little data); one that fails on its training contexts too points at the sampling path
    (the canvas length, the energies, or a train/inference mismatch).
 """
@@ -24,12 +25,14 @@ import glob
 import json
 import random
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
 from text_vpa.configs.schema import SamplerConfig
+from text_vpa.data.ast_parser import ModeExtractor, TreeSitterASTExtractor
 from text_vpa.data.dataset import load_jsonl
 from text_vpa.data.synthetic import CodeRecord
 from text_vpa.evaluation.tasks import load_humaneval_tasks
@@ -55,10 +58,12 @@ def requested_function(context: str) -> str | None:
 
 def parses(code: str) -> bool:
     """Whether ``code`` is syntactically valid Python on its own."""
-    try:
-        ast.parse(code)
-    except (SyntaxError, ValueError):            # ValueError: null bytes
-        return False
+    with warnings.catch_warnings():              # generated code triggers SyntaxWarnings (escapes, literals)
+        warnings.simplefilter("ignore")
+        try:
+            ast.parse(code)
+        except (SyntaxError, ValueError):        # ValueError: null bytes
+            return False
     return True
 
 
@@ -155,6 +160,7 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
                 "context licensed": build_sampler(loaded, use_energy=True)}
     samplers["context licensed"].scfg = SamplerConfig.model_validate(
         {**cfg.sampler.model_dump(), "license_context": True})
+    extractor, modes = TreeSitterASTExtractor(cfg.data.language), ModeExtractor(cfg.data.mode_scheme)
     energy = samplers["as evaluated"].energy
     analysis = energy.analysis if energy is not None else None
     base = frozenset().union(*(t.base_licensed for t in energy.terms if isinstance(t, PlanVocabularyEnergy))) \
@@ -174,7 +180,8 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
             print(f"  {split}: none found")
             continue
         picked = rng.sample(records, min(examples, len(records)))
-        scores = {name: Score() for name in ("as evaluated", "no energies", "reference length", "context licensed")}
+        scores = {name: Score() for name in ("as evaluated", "no energies", "reference length", "context licensed",
+                                             "training conditions")}
         licensed_size = covered = covered_with_context = 0.0
         for i, record in enumerate(picked):
             ids = tok.encode(record.context)[: cfg.data.max_context_tokens] or [tok.pad_id]
@@ -182,11 +189,15 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
             target_len = len(tok.encode(record.target))
             bucket = cfg.data.bucket_size
             reference_n = min(-(-(target_len + 1) // bucket) * bucket, cfg.realizer.max_output_len)
+            reference_mode = _reference_mode(record.target, extractor, modes, device)
             for name, score in scores.items():
-                sampler = samplers["as evaluated" if name == "reference length" else name]
+                sampler = samplers[{"reference length": "as evaluated", "training conditions": "no energies"}
+                                   .get(name, name)]
                 generator = torch.Generator(device=device).manual_seed(seed * 100_003 + i)
+                train_like = name == "training conditions"
                 result = sampler.sample(context, num_steps=k, generator=generator,
-                                        length=reference_n if name == "reference length" else None)
+                                        length=reference_n if name in ("reference length", "training conditions")
+                                        else None, mode=reference_mode if train_like else None)
                 text = result.texts[0]
                 score.add(text, record.target, requested_function(record.context), float(result.unrealized),
                           abs(int(result.tokens.shape[1]) - reference_n))
@@ -206,7 +217,7 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
                                              / max(len(reference_words), 1))
         print(f"  {split}: {len(picked)} examples, K = {k}")
         for name, score in scores.items():
-            print(f"    {name:<17} {score.line()}")
+            print(f"    {name:<19} {score.line()}")
         n = max(len(picked), 1)
         if analysis is not None:
             print(f"    plan-vocabulary energy: the readout licenses {licensed_size / n:.0f} tokens per plan (plus "
@@ -216,6 +227,7 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
         verdict[split + " / reference length"] = scores["reference length"]
         verdict[split + " / no energies"] = scores["no energies"]
         verdict[split + " / context licensed"] = scores["context licensed"]
+        verdict[split + " / training conditions"] = scores["training conditions"]
     if example is not None:
         record, text = example
         print("\n  one training example, as evaluated -- reference (left) | generated (right):")
@@ -227,22 +239,53 @@ def generation_report(run: Path, data: Path, examples: int, k_steps: int | None,
     reading(verdict)
 
 
+def _reference_mode(target: str, extractor: TreeSitterASTExtractor, modes: ModeExtractor,
+                    device: torch.device) -> torch.Tensor | None:
+    """The mode u Stage 2 teacher-forces for ``target`` ([1] int64), or None if the target does not parse."""
+    try:
+        return torch.tensor([modes(extractor.parse(target))], device=device)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def _reproduces(score: Score | None) -> bool:
+    return score is not None and score.fraction("syntax") >= 0.5 and score.fraction("similarity") >= 0.6
+
+
 def reading(verdict: dict[str, Score]) -> None:
-    """One line of interpretation; the thresholds are stated in the output."""
-    train = verdict.get("training contexts (seen in Stage 2)")
+    """A few lines of interpretation; the thresholds are stated in the output."""
+    seen, unseen = "training contexts (seen in Stage 2)", "validation contexts (unseen)"
+    train = verdict.get(seen)
     if train is None:
         return
     print("\n== Reading (thresholds: parses >= 50% and similarity >= 0.6 count as reproducing)")
-    reproduces = train.fraction("syntax") >= 0.5 and train.fraction("similarity") >= 0.6
-    ref = verdict.get("training contexts (seen in Stage 2) / reference length")
-    off = verdict.get("training contexts (seen in Stage 2) / no energies")
-    ctx = verdict.get("training contexts (seen in Stage 2) / context licensed")
+    cond = verdict.get(seen + " / training conditions")
+    ref = verdict.get(seen + " / reference length")
+    off = verdict.get(seen + " / no energies")
+    ctx = verdict.get(seen + " / context licensed")
 
     def better(alt: Score | None) -> bool:
         return alt is not None and (alt.fraction("syntax") >= train.fraction("syntax") + 0.2
-                                    or alt.fraction("similarity") >= train.fraction("similarity") + 0.2)
+                                    or alt.fraction("similarity") >= train.fraction("similarity") + 0.2
+                                    or alt.fraction("named") >= train.fraction("named") + 0.2)
 
-    if reproduces:
+    if cond is not None:
+        if _reproduces(cond):
+            print("  Under Stage 2's training conditions (no energies, reference length and mode) it reproduces")
+            print("  programs it trained on: the realizer and the sampler work at this scale.")
+            if not _reproduces(verdict.get(unseen + " / training conditions")):
+                print("  It does not on unseen contexts: it does not generalize. The remedy is more training data")
+                print("  (and a model sized to it), not decoding settings.")
+        else:
+            print("  Even under Stage 2's training conditions (no energies, reference length and mode) it does not")
+            print("  reproduce programs it trained on: the realizer is under-trained for these programs (or the")
+            print("  recipe cannot fit them). Check that it can memorize a few hundred programs")
+            print("  (scripts/gcp/overfit_check.sh) before collecting more data.")
+        if not _reproduces(train) and (better(off) or better(ctx)):
+            print("  Separately, the plan-vocabulary energy makes generation worse (compare 'as evaluated' with 'no")
+            print("  energies' and 'context licensed'): evaluate with --no-energy or --license-context.")
+        return
+    if _reproduces(train):
         print("  It reproduces its training targets but not unseen programs: it memorized the corpus and does")
         print("  not generalize. The remedy is more training data (and a model sized to it), not decoding settings.")
     elif ref is not None and ref.fraction("similarity") >= train.fraction("similarity") + 0.2:

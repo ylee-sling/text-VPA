@@ -247,7 +247,15 @@ def test_diagnose_reading_names_the_first_suspect(capsys) -> None:
     cases = [({train: score(0.9, 0.8)}, "memorized the corpus"),
              ({train: score(0.1, 0.1), train + " / reference length": score(0.2, 0.5)}, "length head"),
              ({train: score(0.1, 0.1), train + " / no energies": score(0.6, 0.1)}, "energies"),
-             ({train: score(0.0, 0.05)}, "does not match training")]
+             ({train: score(0.0, 0.05)}, "does not match training"),
+             ({train: score(0.0, 0.4), train + " / training conditions": score(0.9, 0.9),
+               "validation contexts (unseen) / training conditions": score(0.0, 0.3)},
+              "does not generalize"),
+             ({train: score(0.0, 0.4), train + " / training conditions": score(0.1, 0.5)}, "under-trained"),
+             ({train: score(0.0, 0.4), train + " / training conditions": score(0.1, 0.5),
+               train + " / no energies": score(0.1, 0.5)}, "under-trained"),
+             ({train: score(0.0, 0.39), train + " / training conditions": score(0.1, 0.5),
+               train + " / no energies": score(0.12, 0.62)}, "plan-vocabulary energy makes generation worse")]
     for verdict, expected in cases:
         reading(verdict)
         assert expected in capsys.readouterr().out
@@ -300,6 +308,7 @@ def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
     assert "4 completions:" in out and "the prompt asks for add()" in out
     assert out.count("as evaluated") >= 3 and "validation contexts (unseen): 3 examples, K = 2" in out
     assert out.count("context licensed") >= 2 and "plan-vocabulary energy: the readout licenses" in out
+    assert out.count("training conditions") >= 2
     assert "== Reading" in out
 
 

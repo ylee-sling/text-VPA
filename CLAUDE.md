@@ -34,7 +34,7 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
 | `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
-| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks) |
+| `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
 
 ## Commands
 
