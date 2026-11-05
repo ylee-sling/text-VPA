@@ -28,7 +28,7 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/inference/energy_terms.py` | Sec. 3.3, Prop. 4 | energies, `PrefixLexer`, Prop. 4(d) check, network-free repair |
 | `text_vpa/data/` | Table 1, Sec. 5.1 | tokenizers, tree-sitter `TreeSitterASTExtractor` + `ModeExtractor`, dataset (compact `Example`, cache, parallel build), collator, synthetic corpus |
 | `text_vpa/data/corpus.py` | Sec. 5.1 "Data" | corpus builder: permissive licenses, self-contained documented functions, AST dedup, 13-word-gram decontamination |
-| `text_vpa/evaluation/` | Sec. 5.2 | unbiased pass@k, resource-limited execution, HumanEval / MBPP tasks (`evaluate.py`) |
+| `text_vpa/evaluation/` | Sec. 5.2 | unbiased pass@k, resource-limited execution, HumanEval / MBPP tasks (`evaluate.py`), `diagnose.py` (post-run checks) |
 | `text_vpa/utils/verification.py` | Sec. 4.6, App. B | NumPy port of the paper's numerical checks (Table 2) |
 | `text_vpa/utils/profiler.py` | Sec. 5.4, App. A.2 | roofline (Table 3), measured latency, simulated AR decoder |
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |

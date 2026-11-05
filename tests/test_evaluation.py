@@ -211,3 +211,85 @@ def test_evaluate_cli_with_a_trained_checkpoint(bench, tmp_path) -> None:
     lines = [json.loads(x) for x in (tmp_path / "eval" / "samples.jsonl").read_text().splitlines()]
     assert len(lines) == 9 and {x["task_id"] for x in lines} == {"MBPP/5", "MBPP/11", "MBPP/700"}
     assert all(x["status"] in ("passed", "failed", "timeout") for x in lines)
+
+
+# =============================================================================================
+# Diagnostics after a Pass@k run (text_vpa.evaluation.diagnose)
+# =============================================================================================
+def test_diagnose_helpers_find_functions_and_score_programs() -> None:
+    import difflib
+
+    from text_vpa.evaluation.diagnose import Score, defined_functions, parses, requested_function
+
+    prompt = 'def helper(x):\n    return x\n\n\nasync def target(a: int) -> int:\n    """Doc."""\n'
+    assert defined_functions(prompt) == ["helper", "target"] and requested_function(prompt) == "target"
+    assert requested_function("x = 1\n") is None
+    assert parses("def f():\n    return 1\n")
+    assert not parses("def all_with_list(003: Generator[0: = list =]) -> float:\n    pass\n")    # the L4 sample
+    assert not parses("a = 1\x00")
+    reference, broken = "def target(a):\n    return a\n", "def other(:\n"
+    score = Score()
+    score.add(reference, reference, "target", stalls=4.0, length_error=2.0)
+    score.add(broken, reference, "target", stalls=0.0)
+    assert (score.n, score.syntax, score.named, score.exact) == (2, 1, 1, 1)
+    assert score.fraction("stalls") == 2.0 and score.fraction("length_error") == 1.0
+    expected = (1.0 + difflib.SequenceMatcher(None, reference, broken, autojunk=False).ratio()) / 2
+    assert score.fraction("similarity") == pytest.approx(expected, rel=1e-12)
+
+
+def test_diagnose_reading_names_the_first_suspect(capsys) -> None:
+    from text_vpa.evaluation.diagnose import Score, reading
+
+    def score(syntax: float, similarity: float) -> Score:
+        return Score(n=10, syntax=round(10 * syntax), similarity=10 * similarity)
+
+    train = "training contexts (seen in Stage 2)"
+    cases = [({train: score(0.9, 0.8)}, "memorized the corpus"),
+             ({train: score(0.1, 0.1), train + " / reference length": score(0.2, 0.5)}, "length head"),
+             ({train: score(0.1, 0.1), train + " / no energies": score(0.6, 0.1)}, "energies"),
+             ({train: score(0.0, 0.05)}, "does not match training")]
+    for verdict, expected in cases:
+        reading(verdict)
+        assert expected in capsys.readouterr().out
+
+
+def test_diagnose_cli_on_a_trained_checkpoint(bench, tmp_path, capsys) -> None:
+    import gzip
+
+    from text_vpa.data.synthetic import synthetic_corpus
+    from text_vpa.evaluation import diagnose
+
+    run, data = tmp_path / "runs", tmp_path / "data"
+    assert train_cli.main(["--stage", "1", "--data", "synthetic:48", "--output-dir", str(run / "stage1"),
+                           "--device", "cpu", "--max-steps", "3", *TINY]) == 0
+    assert train_cli.main(["--stage", "2", "--data", "synthetic:48", "--eval-data", "synthetic:8",
+                           "--eval-every", "1", "--output-dir", str(run / "stage2"), "--device", "cpu",
+                           "--max-steps", "2", "--planner-checkpoint", str(run / "stage1" / "stage1_final.pt"),
+                           "realizer=tiny", "training.batch_size=4"]) == 0
+    (data / "eval").mkdir(parents=True)
+    with gzip.open(data / "eval" / "HumanEval.jsonl.gz", "wt", encoding="utf-8") as handle:
+        handle.writelines(json.dumps(r) + "\n" for r in HUMANEVAL)
+    assert evaluate_cli.main(["--benchmark", "humaneval", "--data", str(data / "eval" / "HumanEval.jsonl.gz"),
+                              "--checkpoint", str(run / "stage2" / "best_stage2.pt"), "--num-samples", "2",
+                              "--k", "1", "--k-steps", "2", "--device", "cpu",
+                              "--out", str(run / "eval" / "humaneval")]) == 0
+    (data / "corpus").mkdir()
+    records = synthetic_corpus(12, seed=3)
+    for name, part in (("train-00000.jsonl.gz", records[:8]), ("val.jsonl.gz", records[8:])):
+        with gzip.open(data / "corpus" / name, "wt", encoding="utf-8") as handle:
+            handle.writelines(json.dumps({"context": r.context, "target": r.target}) + "\n" for r in part)
+    capsys.readouterr()
+    assert diagnose.main(["--run", str(run), "--data", str(data), "--examples", "3", "--k-steps", "2",
+                          "--device", "cpu"]) == 0
+    out = capsys.readouterr().out
+    best = load_checkpoint_step(run / "stage2" / "best_stage2.pt")
+    assert f"best_stage2.pt holds step {best}" in out and "minimum" in out
+    assert "4 completions:" in out and "the prompt asks for add()" in out
+    assert out.count("as evaluated") >= 3 and "validation contexts (unseen): 3 examples, K = 2" in out
+    assert "== Reading" in out
+
+
+def load_checkpoint_step(path) -> int:
+    from text_vpa.engine.runtime import load_checkpoint
+
+    return int(load_checkpoint(path)["step"])

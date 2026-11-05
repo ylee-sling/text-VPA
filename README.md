@@ -307,6 +307,11 @@ python evaluate.py --benchmark humaneval --data data/eval/HumanEval.jsonl.gz \
 python evaluate.py --benchmark mbpp --data data/eval/mbpp.jsonl --reference --out runs/eval/mbpp-reference
 ```
 
+After a run, `python -m text_vpa.evaluation.diagnose` reports which checkpoint was scored (every Stage-2
+validation loss and the step in `best_stage2.pt`), prints HumanEval completions with their errors, and
+generates from training and validation contexts with and without the energies and with the reference
+canvas length. That separates a model that memorized its corpus from a sampling problem.
+
 - **Sampling:** every problem gets n samples from Algorithm 1, with the context the training loaders build.
 - **Programs run:**
   - HumanEval: prompt + sample + tests + `check(entry_point)`;
