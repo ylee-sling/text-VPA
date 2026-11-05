@@ -517,8 +517,8 @@ def download_hf_shards(dataset: str, out_dir: str | Path, folder: str = "data", 
                     written += len(chunk)
             if expected is not None and written != int(expected):
                 raise ValueError(f"truncated download: {written} of {expected} bytes")
-            if size is not None and written != size:
-                raise ValueError(f"size {written} differs from the listing's {size}")
+            if expected is None and size is not None and written != size:    # no Content-Length: the listing's
+                raise ValueError(f"truncated download: {written} of {size} bytes (the listing's size)")
             part.replace(raw)
 
         for trial in (1, 2):                                  # a corrupt file is fetched once more
