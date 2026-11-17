@@ -33,6 +33,8 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/utils/profiler.py` | Sec. 5.4, App. A.2 | roofline (Table 3), measured latency, simulated AR decoder |
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
 | `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
+| `text_vpa/stage0/` | Text-VPA Sec. 3, Sec. 6 (Stage 0) | the plan-free Gemma 4 E2B realizer: `backbone.py` (prompt prefill by the frozen backbone, canvas-only LoRA, bidirectional canvas, mask embedding, zero-init (t, h) modulation, AR shift with a clamped anchor), `data.py`, `sampler.py` (exact jump kernel on the mask source), `autoregressive.py` (the baseline: the model's own `generate`), `postprocess.py`, `train.py`, `evaluate.py`, `report.py` (H2 verdict), `preflight.py` |
+| `scripts/ncp/stage0.sh` | — | Stage 0 on the NCP L4 server, resumable; never shuts the server down |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
 | `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline; `CORPUS=shards` all of github-code-clean, up to 2M functions, or `export`; corpus recipe and run-corpus guards; Pass@k with and without energies), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown, outcome markers per run directory; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
 
@@ -46,6 +48,7 @@ ruff check .                                 # must pass
 python -m text_vpa.utils.verification        # Appendix B checks; must reproduce Table 2
 python -m text_vpa.utils.profiler --roofline # must reproduce Table 3
 python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference --out /tmp/he  # harness: 164/164
+python -m pytest tests/test_stage0.py tests/test_stage0_cli.py   # Stage 0, on a tiny random Gemma 4
 ```
 
 ## Non-negotiable rules
@@ -63,6 +66,24 @@ python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference -
 5. **Prop. 4(d).** Plan-mediated hard energies depend on (j, Z) only; draft-dependent terms read only the
    prefix w_{<i} (so the left-to-right repair is exact). Keep `check_parallel_update` active in the sampler.
 6. **No stubs** in core logic (losses, kernels, sampler, energies, trainers).
+
+## Stage 0 (Text-VPA; `text_vpa/stage0/`, decisions in `docs/stage0.md`)
+
+The rest of this repository implements PR-JEPA. Stage 0 is the first piece of the Text-VPA design and has its
+own rules:
+
+1. **The backbone is never modified.** Its parameters are frozen; a checkpoint holds only the LoRA factors, the
+   mask embedding and the modulation. `Stage0Realizer` must reproduce `Gemma4ForCausalLM` under causal masks
+   with the adapters at their initial values (tested); keep that test when transformers is upgraded.
+2. **One prompt cache.** No adapter acts on prompt positions and prompt rows never attend to the canvas, so
+   `prefill` is the frozen backbone. Do not add anything trainable to the prefill path.
+3. **Same treatment for both decoders.** Prompt, token budget, token draw and truncation are shared by the
+   realizer and the autoregressive baseline (`evaluate.py`, `postprocess.py`). A change to one is a change to
+   both, and the baseline stays the released model's own `generate`.
+4. **Adapter state is an argument.** The switch that turns the adapters on is set inside `_block`, because
+   activation checkpointing calls the block again during the backward pass.
+5. **Nothing is selected on a test set.** The probe uses MBPP's validation split; the final checkpoint is the
+   one evaluated; H2's decision rule is in `report.py` and `docs/stage0.md` and was fixed before the run.
 
 ## Tests
 

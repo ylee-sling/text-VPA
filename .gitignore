@@ -26,6 +26,7 @@ multirun/
 
 # Datasets, checkpoints and logs (never commit)
 /data/
+/data[0-9]*/
 datasets/
 *.jsonl.gz
 checkpoints/

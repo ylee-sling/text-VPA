@@ -347,6 +347,19 @@ from 12 to 125 (d = 256) over 50K steps, so the guard would have rejected a plan
 steps and printed after Stage 1, but it does not stop the run. `COLLAPSE_GRACE=N` lets the guard reject from
 step N.
 
+## Text-VPA Stage 0: Gemma 4 E2B as a plan-free realizer
+
+The successor design, Text-VPA, replaces the from-scratch realizer by a pretrained backbone. Its first
+experiment (Stage 0, hypothesis H2) adapts Gemma 4 E2B into the realizer without a plan and compares K = 2, 4, 8
+parallel steps with the same checkpoint's autoregressive decoding in the Pass@k harness below. Design, recorded
+decisions and how to read the result: [`docs/stage0.md`](docs/stage0.md).
+
+```bash
+SMOKE=1 bash scripts/ncp/stage0.sh     # the whole pipeline in miniature (a check of the server)
+bash scripts/ncp/stage0.sh             # the run: baseline, training, K = 2, 4, 8, report
+bash scripts/ncp/stage0.sh status
+```
+
 ## Evaluation (Pass@k)
 
 ```bash
