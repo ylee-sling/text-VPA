@@ -400,7 +400,7 @@ def test_example_formats():
     prompt, body = s0data.complete_example(ROW)
     assert prompt == ROW["context"] and prompt + body == ROW["target"]
     prompt, code = s0data.write_example(ROW)
-    assert prompt == '"""\nReturn the area of a circle.\n\nUses pi.\nassert area(r, scale) == ...\n"""\n'
+    assert prompt == '"""\nReturn the area of a circle.\n\nUses pi.\nassert area(r, scale) == ...\n"""\n\n'
     assert code == ("import math as m\n\n\ndef area(r: float, *, scale=1) -> float:\n    # comment\n"
                     "    return m.pi * r ** 2 * scale\n")
     compile(code, "<write>", "exec")
@@ -410,7 +410,7 @@ def test_example_formats():
     assert s0data.write_example({"context": "", "target": one_line, "documented": True}) is None
     assert s0data.complete_example({"context": "def f():\n", "target": "def g():\n    pass\n"}) is None
     assert s0data.mbpp_prompt("Add two numbers.\nassert add(1, 2) == 3") == \
-        '"""\nAdd two numbers.\nassert add(1, 2) == 3\n"""\n'
+        '"""\nAdd two numbers.\nassert add(1, 2) == 3\n"""\n\n'      # the blank line: see data.py
 
 
 def test_tokenize_collate_and_training_state():

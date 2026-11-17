@@ -55,8 +55,12 @@ Each line: the choice, the reason, and the alternative that was not taken.
    reference row, so a weak baseline cannot pass unnoticed. Alternative: adapt `-it` and prompt both decoders
    through the chat template.
 2. **Prompt formats.** HumanEval: the prompt as is, the canvas is the body (`complete`). MBPP: the task text and its
-   first test inside a module docstring, the canvas is the whole program (`write`; the BigCode harness's zero-shot
-   MBPP format). The same strings go to both decoders.
+   first test inside a module docstring followed by a blank line, the canvas is the whole program (`write`). The
+   same strings go to both decoders. The blank line is a measured fix: with the BigCode harness's zero-shot format
+   (one newline after the docstring) Gemma 4 E2B wrote MBPP functions without indentation and none of the smoke
+   run's baseline programs parsed; with the blank line its greedy output on MBPP/11 is indented and correct, as it
+   is with the 3-shot format of Austin et al. (700 prompt tokens instead of 39, and unlike the zero-shot training
+   data).
 3. **Canvas length N = 256, fixed.** Program tokens, one `<eos>`, then `<eos>` up to N. With the Gemma 3
    SentencePiece vocabulary (262,144 tokens; the preflight repeats the count with the Gemma 4 tokenizer) 99.4% of
    HumanEval's canonical bodies and 98.8% of MBPP's programs fit. Training examples that do not fit are dropped,
@@ -91,7 +95,9 @@ Each line: the choice, the reason, and the alternative that was not taken.
     orders of magnitude below published adaptations (DiffuLLaMA: under 200B tokens; DiffuCoder: 65B + 65B). The
     learning curve below exists for that reason.
 13. **Data mix.** Every corpus row gives a `complete` example; a documented top-level function gives a `write`
-    example instead with probability 0.5: description = its docstring plus the line
+    example instead with probability 0.5 (about 11% of all examples: 71% of the corpus are methods, which have no
+    description-only form; a higher probability would take the most HumanEval-like functions away from
+    `complete`): description = its docstring plus the line
     `assert name(parameters) == ...` (MBPP names the function in an assert; the corpus has no tests), canvas =
     imports + the function without its docstring. Prompts over 512 tokens are dropped.
 14. **Sampler.** Primary, and the one H2 is decided on: the exact jump kernel on the mask source, i.e. each masked

@@ -263,6 +263,7 @@ EOF
     log "autoregressive baseline: the model's own generate, $NUM_SAMPLES samples per problem"
     "$PY" -m text_vpa.stage0.evaluate --decoder ar "${EVAL_COMMON[@]}"
     mark ar
+    "$PY" -m text_vpa.stage0.report --eval "$RUN/eval" >/dev/null    # the baseline shows in `status` now
   fi
 
   # ---- 8. training ------------------------------------------------------------------------------

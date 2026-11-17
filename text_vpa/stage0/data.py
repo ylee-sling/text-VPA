@@ -8,10 +8,12 @@ autoregressive baseline:
 
     complete   the prompt is a function's imports + signature + docstring (HumanEval's prompt; the corpus's
                ``context``); the canvas is the rest of the function (the body).
-    write      the prompt is a description inside a module docstring,
-                   '\"\"\"\\n' + description + '\\n\"\"\"\\n'
-               (the zero-shot MBPP format of the BigCode evaluation harness; for MBPP the description is the
-               task text and its first test); the canvas is the whole program.
+    write      the prompt is a description inside a module docstring followed by a blank line,
+                   '\"\"\"\\n' + description + '\\n\"\"\"\\n\\n'
+               (for MBPP the description is the task text and its first test); the canvas is the whole program.
+               The blank line matters: with a single newline after the docstring (the BigCode harness's format)
+               Gemma 4 E2B writes function bodies without indentation, greedy and sampled alike (measured on
+               the L4, 17 Nov 2026); real modules put a blank line there.
 
 Training examples come from the repository's corpus (``text_vpa.data.corpus``: {"context", "target", ...} rows,
 ``target`` starting with ``context``). Every row yields a ``complete`` example; a documented top-level function
@@ -103,7 +105,7 @@ class HFTokenizer:
 # Prompt formats
 # ---------------------------------------------------------------------------------------------
 def write_prompt(description: str) -> str:
-    return '"""\n' + description.strip("\n") + '\n"""\n'
+    return '"""\n' + description.strip("\n") + '\n"""\n\n'
 
 
 def mbpp_prompt(context: str) -> str:
