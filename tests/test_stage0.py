@@ -405,6 +405,12 @@ def test_example_formats():
                     "    return m.pi * r ** 2 * scale\n")
     compile(code, "<write>", "exec")
     assert s0data.write_example({**ROW, "method": True}) is None
+    import warnings
+
+    escaped = {**ROW, "target": ROW["target"].replace("return m.pi", 'x = "\\d"\n    return m.pi')}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                                # a SyntaxWarning would raise here
+        assert s0data.write_example(escaped) is not None
     assert s0data.write_example({**ROW, "documented": False}) is None
     one_line = 'def f(x):\n    """Doc."""; return x\n'
     assert s0data.write_example({"context": "", "target": one_line, "documented": True}) is None

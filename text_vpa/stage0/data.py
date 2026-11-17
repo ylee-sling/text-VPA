@@ -37,6 +37,7 @@ import hashlib
 import inspect
 import json
 import random
+import warnings
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,7 +132,9 @@ def write_example(row: dict) -> tuple[str, str] | None:
         return None
     target = row["target"]
     try:
-        module = ast.parse(target)
+        with warnings.catch_warnings():                          # e.g. "\\d" in a plain string of corpus code
+            warnings.simplefilter("ignore")
+            module = ast.parse(target)
     except (SyntaxError, ValueError, RecursionError):
         return None
     functions = [n for n in module.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
