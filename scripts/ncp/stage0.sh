@@ -99,7 +99,7 @@ if probes:
 EOF
   fi
   if [[ -f "$RUN/eval/report.md" ]]; then echo; cat "$RUN/eval/report.md"; fi
-  if command -v tmux >/dev/null && tmux has-session -t "$SESSION" 2>/dev/null; then
+  if command -v tmux >/dev/null && tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "tmux session '$SESSION' is running"
   else
     echo "no tmux session '$SESSION'"
@@ -114,7 +114,11 @@ launch() {
   mkdir -p "$RUN"
   [[ -x "$PY" ]] || die "$PY is missing: this script uses the repository's .venv"
   if command -v tmux >/dev/null; then
-    tmux has-session -t "$SESSION" 2>/dev/null && die "tmux session '$SESSION' already exists (tmux attach -t $SESSION)"
+    # "=name" matches the session name exactly: a bare -t matches by prefix, so "stage0" would find
+    # "stage0-smoke".
+    if tmux has-session -t "=$SESSION" 2>/dev/null; then
+      die "tmux session '$SESSION' already exists (tmux attach -t '=$SESSION')"
+    fi
     # The variables are passed explicitly (-e, tmux >= 3.2): a running tmux server would otherwise hand its
     # own, older environment to the new session.
     local env_args=() name
@@ -125,7 +129,7 @@ launch() {
     tmux new-session -d -s "$SESSION" -c "$ROOT" "${env_args[@]}" \
       "bash scripts/ncp/stage0.sh run 2>&1 | tee -a '$LOG'"
     echo "started in tmux session '$SESSION'"
-    echo "  watch:   tmux attach -t $SESSION      (detach: Ctrl-b d)"
+    echo "  watch:   tmux attach -t '=$SESSION'      (detach: Ctrl-b d)"
   else
     nohup setsid bash scripts/ncp/stage0.sh run >> "$LOG" 2>&1 < /dev/null &
     echo "started in the background (tmux is not installed), pid $!"
