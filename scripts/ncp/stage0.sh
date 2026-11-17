@@ -50,6 +50,9 @@ cd "$ROOT"
 # ROS 2 and any other environment's Python paths stay out, whatever the calling shell or tmux server holds.
 unset PYTHONPATH PYTHONHOME PYTHONSTARTUP VIRTUAL_ENV CONDA_PREFIX
 export PYTHONNOUSERSITE=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=1 PYTHONUNBUFFERED=1
+# The worst-case micro-batch peaks at about 90% of the L4's memory; expandable segments keep the caching
+# allocator from failing on fragmentation when real batches of varying shape follow each other.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SMOKE="${SMOKE:-0}"
 if [[ "$SMOKE" == 1 ]]; then

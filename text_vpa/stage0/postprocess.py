@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import re
+import warnings
 
 from text_vpa.evaluation.tasks import EvalTask
 
@@ -68,8 +69,12 @@ def build_sample(task: EvalTask, benchmark: str, text: str, chat: bool = False) 
 
 
 def parses(program: str) -> bool:
+    """True when ``program`` is valid Python. Warnings about its contents (e.g. "\\d" in a plain string) are
+    the program's business, not the evaluator's, and are not printed."""
     try:
-        ast.parse(program)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ast.parse(program)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False
     return True

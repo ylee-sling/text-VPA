@@ -37,6 +37,7 @@ from text_vpa.stage0.postprocess import (  # noqa: E402
     build_sample,
     extract_fenced,
     is_complete,
+    parses,
     truncate_complete,
     truncate_write,
 )
@@ -498,6 +499,11 @@ def test_truncation_rules():
     assert not is_complete("def f(x):\n    return x\n", "write")
     assert extract_fenced("Here:\n```python\ndef f():\n    return 1\n```\nDone.") == "def f():\n    return 1\n"
     assert extract_fenced("def f():\n    return 1") == "def f():\n    return 1\n"
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                                # a warning would raise here
+        assert parses('import re\nx = re.compile("\\d+")\n') and not parses("def f(:\n")
 
 
 def _tasks() -> tuple[EvalTask, EvalTask]:
