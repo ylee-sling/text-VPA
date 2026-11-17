@@ -883,13 +883,20 @@ def test_bpe_trains_on_an_evenly_spaced_sample_of_a_large_corpus(monkeypatch) ->
     assert len(seen[-1]) == 20                                              # fewer records than the cap: all
 
 
-def test_release_records_frees_the_records_and_freezes_only_for_workers() -> None:
+def test_release_records_frees_the_records_and_freezes_only_for_workers(monkeypatch) -> None:
     import gc
 
+    # Whether gc.freeze() is called, not the frozen count: on CPython 3.12 a collection moves the interpreter's
+    # immortal objects into the permanent generation, so after a gc.unfreeze() (train.main ends with one) the
+    # count rises at the next gc.collect() although nothing called gc.freeze() (375 objects on 3.12.16).
+    calls: list[bool] = []
+    monkeypatch.setattr(gc, "freeze", lambda: calls.append(True))
     records, other = [1, 2, 3], None
-    before = gc.get_freeze_count()
     train_cli.release_records(records, other)
-    assert records == [] and gc.get_freeze_count() == before
+    assert records == [] and calls == []
+    train_cli.release_records([4], freeze=True)
+    assert calls == [True]
+    monkeypatch.undo()
     try:
         train_cli.release_records([4], freeze=True)
         assert gc.get_freeze_count() > 0
