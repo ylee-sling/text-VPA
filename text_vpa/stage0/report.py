@@ -35,6 +35,8 @@ from typing import Any
 
 import numpy as np
 
+from text_vpa.stage0.analyze import tag_order
+
 __all__ = ["bootstrap_ratio", "h2_verdict", "learning_curve", "per_task_rates"]
 
 THRESHOLD = 0.5
@@ -116,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--eval", type=Path, required=True)
     p.add_argument("--run", type=Path, default=None, help="training run (learning curve)")
     p.add_argument("--out", type=Path, default=None, help="default: the --eval directory")
+    p.add_argument("--no-verdict", action="store_true",
+                   help="only the table: for diagnostics outside the protocol (e.g. the K sweep on MBPP validation)")
     args = p.parse_args(argv)
     out = args.out or args.eval
 
@@ -123,7 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     ratios: dict[str, tuple[float, float, float]] = {}
     for bench_dir in sorted(d for d in args.eval.iterdir() if d.is_dir()):
         summaries = {}
-        for tag_dir in sorted(d for d in bench_dir.iterdir() if (d / "summary.json").exists()):
+        for tag_dir in sorted((d for d in bench_dir.iterdir() if (d / "summary.json").exists()),
+                              key=lambda d: tag_order(d.name)):
             summaries[tag_dir.name] = json.loads((tag_dir / "summary.json").read_text())
             s = summaries[tag_dir.name]
             table.append({"benchmark": bench_dir.name, "tag": tag_dir.name, "pass@1": s.get("pass@1"),
@@ -139,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             tasks = sorted(a)
             ratios[bench_dir.name] = bootstrap_ratio(np.array([a[t] for t in tasks]), np.array([b[t] for t in tasks]))
 
-    verdict = h2_verdict(ratios)
+    verdict = "not evaluated (diagnostic outside the protocol)" if args.no_verdict else h2_verdict(ratios)
     curve = learning_curve(args.run) if args.run else []
     lines = ["# Text-VPA Stage 0: plan-free Gemma 4 E2B realizer against its own autoregressive decoding", "",
              "| benchmark | decoder | Pass@1 | Pass@10 | parses | sequential depth | tokens |",
@@ -151,13 +156,16 @@ def main(argv: list[str] | None = None) -> int:
     for row in table:
         lines.append(f"| {row['benchmark']} | {row['tag']} | {pct(row['pass@1'])} | {pct(row['pass@10'])} | "
                      f"{pct(row['parse_rate'])} | {row['depth']} | {row['mean_tokens']} |")
-    lines += ["", f"## H2: {verdict}", "",
-              f"Ratio of Pass@1, `{PRIMARY}` over `{BASELINE}`; threshold {THRESHOLD}; 95% paired bootstrap over problems.",
-              ""]
-    for bench, (rho, low, high) in ratios.items():
-        lines.append(f"- {bench}: rho = {rho:.3f} [{low:.3f}, {high:.3f}]")
-    if not ratios:
-        lines.append(f"- no benchmark has both `{PRIMARY}` and `{BASELINE}`")
+    if args.no_verdict:
+        lines[0] = "# Text-VPA Stage 0, diagnostic outside the protocol (no H2 verdict)"
+    else:
+        lines += ["", f"## H2: {verdict}", "",
+                  f"Ratio of Pass@1, `{PRIMARY}` over `{BASELINE}`; threshold {THRESHOLD}; 95% paired bootstrap over "
+                  "problems.", ""]
+        for bench, (rho, low, high) in ratios.items():
+            lines.append(f"- {bench}: rho = {rho:.3f} [{low:.3f}, {high:.3f}]")
+        if not ratios:
+            lines.append(f"- no benchmark has both `{PRIMARY}` and `{BASELINE}`")
     if curve:
         lines += ["", "## Learning curve (Pass@1 on MBPP validation, K = 8)", "",
                   ", ".join(f"{step}: {100 * value:.1f}%" for step, value in curve), "", curve_note(curve)]

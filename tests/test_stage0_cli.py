@@ -114,3 +114,6 @@ def test_stage0_pipeline(tmp_path, capsys):
     assert set(result["ratios"]) == {"humaneval", "mbpp"} and [s for s, _ in result["learning_curve"]] == [0, 2, 4, 6]
     assert result["verdict"].startswith(("undecided", "clearly", "holds", "fails", "mixed"))
     assert "## H2:" in (out / "report.md").read_text()
+    assert report.main(["--eval", str(out), "--out", str(run / "diag"), "--no-verdict"]) == 0
+    assert "## H2:" not in (run / "diag" / "report.md").read_text()
+    assert json.loads((run / "diag" / "report.json").read_text())["verdict"].startswith("not evaluated")

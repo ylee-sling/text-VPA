@@ -148,6 +148,15 @@ to the Text-VPA realizer and belongs in Sec. 2.
 
 ## Reading the result
 
+- `python -m text_vpa.stage0.analyze --eval RUN/eval` sorts every sample into passed, empty, syntax error, wrong
+  answer, runtime error or timeout, lists the most frequent syntax errors, and counts adjacent repeated
+  identifiers (a symptom of positions decided in parallel from the same context).
+- `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates the trained realizer at K = 8, 16, 32, 64 and 128
+  with both samplers on MBPP's validation split, next to the baseline on the same split. It is outside the
+  protocol and has no verdict. If Pass@1 rises steeply with K, the denoiser is sound and the problem is
+  realizing in few steps; if even K = 128 stays poor, the adaptation itself is too weak. The realizer was
+  trained only at the (t, h) values of K in {2, 4, 8}, so K > 8 is also off its training distribution.
+
 - `report.md` lists Pass@1, Pass@10, the fraction of programs that parse, the sequential depth and the mean
   number of tokens for every configuration, then the H2 verdict with its intervals and the learning curve.
 - `samples.jsonl` holds every sample: the raw text, the program that was run, whether it parsed, and the test

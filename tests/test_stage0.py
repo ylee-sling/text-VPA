@@ -685,3 +685,53 @@ def test_bootstrap_ratio_and_verdict():
     assert h2_verdict({"humaneval": (0.4, 0.3, 0.55), "mbpp": (0.1, 0.05, 0.2)}) == "fails"
     assert h2_verdict({"humaneval": (0.6, 0.5, 0.7), "mbpp": (0.3, 0.2, 0.4)}) == "mixed"
     assert h2_verdict({}).startswith("undecided")
+
+
+# =============================================================================================
+# Failure analysis
+# =============================================================================================
+def _sample(passed=False, raw="def f():\n    return 1\n", parses=True, status="failed", detail=""):
+    return {"task_id": "T", "sample": 0, "passed": passed, "status": status, "parses": parses, "detail": detail,
+            "completion": raw, "raw": raw}
+
+
+def test_failure_outcomes_and_messages():
+    from text_vpa.stage0.analyze import OUTCOMES, classify, repeated_identifiers, summarize_samples, syntax_message
+
+    indent = 'File "<p>", line 2\n    return x\n    ^^^^^^\nIndentationError: expected an indented block after ' \
+             "function definition on line 1"
+    rows = [
+        _sample(passed=True, status="passed"),
+        _sample(raw="   \n"),
+        _sample(parses=False, detail=indent),
+        _sample(parses=False, detail="SyntaxError: '(' was never closed"),
+        _sample(detail="Traceback (most recent call last):\n  File ...\nAssertionError"),
+        _sample(detail="Traceback (most recent call last):\nNameError: name 'x' is not defined"),
+        _sample(status="timeout", detail="timeout"),
+        _sample(detail="TabError: inconsistent use of tabs and spaces in indentation"),   # parses here, not there
+    ]
+    assert [classify(r) for r in rows] == ["passed", "empty", "syntax", "syntax", "wrong", "runtime", "timeout",
+                                           "syntax"]
+    assert syntax_message(rows[2]) == "IndentationError: expected an indented block after function definition"
+    assert syntax_message(rows[3]) == "SyntaxError: '(' was never closed"
+    assert repeated_identifiers("return return x x (( y") == (2, 7)      # "((" is punctuation, not counted
+    summary = summarize_samples(rows)
+    assert summary["samples"] == 8 and math.isclose(sum(summary[k] for k in OUTCOMES), 1.0)
+    assert summary["syntax"] == 3 / 8 and summary["passed"] == summary["wrong"] == 1 / 8
+    assert summary["top_syntax_errors"][0][1] == 1 and len(summary["top_syntax_errors"]) == 3
+
+
+def test_analysis_cli_orders_configurations(tmp_path):
+    from text_vpa.stage0 import analyze
+
+    for tag, rows in {"realizer-K16": [_sample()], "realizer-K8-confidence": [_sample(passed=True, status="passed")],
+                      "realizer-K8": [_sample(parses=False, detail="SyntaxError: invalid syntax")],
+                      "ar": [_sample(passed=True, status="passed")], "realizer-K2": [_sample(raw="")]}.items():
+        (tmp_path / "mbpp" / tag).mkdir(parents=True)
+        with open(tmp_path / "mbpp" / tag / "samples.jsonl", "w", encoding="utf-8") as handle:
+            handle.writelines(json.dumps(r) + "\n" for r in rows)
+    assert analyze.main(["--eval", str(tmp_path)]) == 0
+    result = json.loads((tmp_path / "analysis.json").read_text())
+    assert list(result["mbpp"]) == ["ar", "realizer-K2", "realizer-K8", "realizer-K8-confidence", "realizer-K16"]
+    assert result["mbpp"]["realizer-K8"]["syntax"] == 1.0 and result["mbpp"]["realizer-K2"]["empty"] == 1.0
+    assert "SyntaxError: invalid syntax (1)" in (tmp_path / "analysis.md").read_text()
