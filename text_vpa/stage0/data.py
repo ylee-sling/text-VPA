@@ -161,6 +161,15 @@ def write_example(row: dict) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------------------------
 # Examples and batches
 # ---------------------------------------------------------------------------------------------
+def _is_unicode(text: str) -> bool:
+    """False for strings with lone surrogates, which have no UTF-8 encoding."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class Example:
     prompt_ids: list[int]          # <bos> + prompt; its last token is the canvas anchor
@@ -170,11 +179,19 @@ class Example:
 
 def tokenize_examples(pairs: Sequence[tuple[str, str, str]], tokenizer: Stage0Tokenizer, canvas_len: int,
                       max_prompt_tokens: int) -> tuple[list[Example], dict[str, int]]:
-    """(prompt, canvas text, kind) triples -> examples; counts what was dropped and why."""
+    """(prompt, canvas text, kind) triples -> examples; counts what was dropped and why.
+
+    Texts that are not valid Unicode are dropped first: a lone surrogate (e.g. "\\ud83d", half of an emoji, which
+    JSON can store) makes the Hugging Face tokenizer raise a TypeError for the whole batch. One such corpus row
+    stopped the first full run at step 22,960.
+    """
+    dropped = {"canvas_too_long": 0, "prompt_too_long": 0, "special_token": 0, "invalid_unicode": 0}
+    valid = [pair for pair in pairs if _is_unicode(pair[0]) and _is_unicode(pair[1])]
+    dropped["invalid_unicode"] = len(pairs) - len(valid)
+    pairs = valid
     prompts = tokenizer.encode_batch([p for p, _, _ in pairs])
     canvases = tokenizer.encode_batch([c for _, c, _ in pairs])
     out: list[Example] = []
-    dropped = {"canvas_too_long": 0, "prompt_too_long": 0, "special_token": 0}
     special = {tokenizer.mask_id, tokenizer.eos_id, tokenizer.bos_id}
     for (_, _, kind), prompt, canvas in zip(pairs, prompts, canvases, strict=True):
         if len(canvas) + 1 > canvas_len:
@@ -276,7 +293,7 @@ class CorpusStream:
         self.tokenizer, self.canvas_len, self.max_prompt_tokens = tokenizer, canvas_len, max_prompt_tokens
         self.write_fraction, self.seed, self.chunk_rows = write_fraction, seed, chunk_rows
         self.dropped: dict[str, int] = {"canvas_too_long": 0, "prompt_too_long": 0, "special_token": 0,
-                                        "not_prefix": 0}
+                                        "invalid_unicode": 0, "not_prefix": 0}
         self.rows_read = 0
         self._start = dict(state) if state else {"epoch": 0, "shard": 0, "row": 0, "taken": 0}
         self._chunk_state = dict(self._start)

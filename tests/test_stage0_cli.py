@@ -56,6 +56,22 @@ def write_benchmarks(path) -> None:
                                      "test_list": [f"assert plus(1) == {task_id + 1}"], "test_setup_code": ""}) + "\n")
 
 
+def test_a_lone_surrogate_in_the_corpus_is_dropped_not_fatal(tmp_path):
+    """The Hugging Face tokenizer rejects a whole batch over one lone surrogate (it stopped the first L4 run)."""
+    from text_vpa.stage0.data import CorpusStream, HFTokenizer
+
+    write_checkpoint(tmp_path / "model")
+    _write_corpus(tmp_path / "corpus", functions=8, shards=1)
+    bad = {"context": "def bad(a):\n", "target": 'def bad(a):\n    return "\ud83d"\n', "documented": False}
+    with gzip.open(tmp_path / "corpus" / "train-00000.jsonl.gz", "at", encoding="utf-8") as handle:
+        handle.write(json.dumps(bad) + "\n")                            # json.dumps escapes it as \\ud83d
+    tokenizer = HFTokenizer(transformers.AutoTokenizer.from_pretrained(tmp_path / "model"))
+    with pytest.raises(TypeError, match="TextEncodeInput"):
+        tokenizer.encode_batch([bad["target"]])                         # the failure being guarded against
+    stream = CorpusStream(tmp_path / "corpus", tokenizer, 64, 128, write_fraction=0.0, chunk_rows=4)
+    assert len(stream.take(16)) == 16 and stream.dropped["invalid_unicode"] >= 1
+
+
 def test_stage0_pipeline(tmp_path, capsys):
     model, corpus, bench, run = tmp_path / "model", tmp_path / "corpus", tmp_path / "eval", tmp_path / "run"
     write_checkpoint(model)

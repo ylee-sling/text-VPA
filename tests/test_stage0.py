@@ -423,7 +423,12 @@ def test_tokenize_collate_and_training_state():
     tok = CharTokenizer()
     pairs = [("def f(x):\n", "    return x\n", "complete"), ("p", "y" * 40, "complete"), ("q" * 30, "z", "complete")]
     examples, dropped = s0data.tokenize_examples(pairs, tok, canvas_len=20, max_prompt_tokens=16)
-    assert len(examples) == 1 and dropped == {"canvas_too_long": 1, "prompt_too_long": 1, "special_token": 0}
+    assert len(examples) == 1 and dropped == {"canvas_too_long": 1, "prompt_too_long": 1, "special_token": 0,
+                                              "invalid_unicode": 0}
+    surrogate = json.loads('"    return \\"\\ud83d\\"\\n"')                    # a lone surrogate, as JSON stores it
+    assert len(surrogate) == 15 and not surrogate.isascii()
+    kept, dropped = s0data.tokenize_examples([pairs[0], ("def g():\n", surrogate, "complete")], tok, 20, 16)
+    assert [e.canvas_ids for e in kept] == [examples[0].canvas_ids] and dropped["invalid_unicode"] == 1
     ex = examples[0]
     assert ex.prompt_ids[0] == tok.bos_id and ex.canvas_ids[-1] == tok.eos_id and len(ex.canvas_ids) == 14
     batch = s0data.collate([ex, ex], 20, tok.eos_id)
