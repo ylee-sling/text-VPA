@@ -401,11 +401,13 @@ class ScriptedRealizer:
         self.vocab = vocab
         self.masks: list[torch.Tensor] = []
         self.calls: list[tuple[str, bool]] = []
+        self.times: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def canvas_hidden(self, cache, canvas_ids, is_mask, t, h, mode="bidirectional", adapters=True):
         self.passes["canvas"] += 1
         self.masks.append(is_mask[:, 1:].clone())
         self.calls.append((mode, adapters))
+        self.times.append((t.clone(), h.clone()))
         b, c = canvas_ids.shape
         hidden = torch.zeros(b, c, self.vocab)
         hidden[:, : len(self.script)] = torch.nn.functional.one_hot(self.script, self.vocab).float()
@@ -504,6 +506,31 @@ def test_backbone_mode_of_the_sampler_is_greedy_generate():
                          adapters=False, stop_id=1)
     assert result.revealed[:len(want)] == [1] * len(want)              # one token per step
     assert cut_at_eos(result.tokens[0].tolist(), [1]) == want and len(want) >= 3
+
+
+def test_matched_time_gives_the_network_a_pair_seen_in_training():
+    from text_vpa.stage0.sampler import network_time
+
+    schedule = KappaSchedule("cosine")
+    masked = torch.zeros(4, 40, dtype=torch.bool)
+    for row, count in enumerate((40, 31, 12, 1)):                     # revealed fractions 0, 9/40, 28/40, 39/40
+        masked[row, 40 - count:] = True
+    t, h = network_time(SamplerConfig(num_steps=256), schedule, 3 / 256, 1 / 256, masked)
+    assert t.tolist() == [3 / 256] * 4 and h.tolist() == [1 / 256] * 4    # "schedule": Algorithm 1's values
+    t, h = network_time(SamplerConfig(num_steps=256, time_input="matched"), schedule, 3 / 256, 1 / 256, masked)
+    want = []
+    for count in (40, 31, 12, 1):                                     # an independent loop over the grid
+        revealed = 1 - count / 40
+        gaps = [abs((1 - math.cos(math.pi * (j / 8) / 2)) - revealed) for j in range(8)]
+        want.append(gaps.index(min(gaps)) / 8)
+    assert t.tolist() == want and want == [0.0, 0.375, 0.75, 0.875] and h.tolist() == [0.125] * 4
+    realizer = ScriptedRealizer([10, 11, 12, 13, 14, 1, 20, 21])
+    realize(realizer, None, torch.full((2,), 9), 8,
+            SamplerConfig(num_steps=8, schedule="cosine", order="left_to_right", time_input="matched"), stop_id=1)
+    grid = {j / 8 for j in range(8)}
+    assert all(set(t_in.tolist()) <= grid and set(h_in.tolist()) == {0.125} for t_in, h_in in realizer.times)
+    with pytest.raises(ValueError, match="time_input"):
+        SamplerConfig(time_input="interpolated")
 
 
 def test_realizer_samples_passes_the_canvas_mode_and_adapters():

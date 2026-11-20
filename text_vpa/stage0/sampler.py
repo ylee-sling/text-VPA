@@ -33,6 +33,14 @@ prefix, which likewise fixes the program.
 decoding, computed through this code path: the check that the realizer's implementation reproduces the
 baseline on the real model.
 
+The (t, h) the network is given. ``time_input="schedule"`` (default): t_k = k/K and h = 1/K, as in Algorithm 1.
+The realizer is trained only at t = k/K, h = 1/K for its step budgets (K in {2, 4, 8}: t a multiple of 1/8, h
+in {1/2, 1/4, 1/8}), and enters them as sinusoidal features of 1000 t and 1000 h, so K > 8 gives it values it
+never saw (h = 1/256 -> 3.9 against 125 to 500). ``time_input="matched"`` gives it a pair from training instead:
+h = 1/``time_grid`` and, per row, the grid time t = j/``time_grid`` whose kappa_t is closest to the fraction of
+the canvas already revealed (with the mask source a training state at t has a fraction kappa_t revealed). The
+reveal schedule itself is unchanged.
+
 Token draw (both orders, and the autoregressive baseline through ``generate``): temperature, then the
 ``top_k`` most probable tokens, then the smallest nucleus of mass >= ``top_p`` among them. temperature 0 is the
 argmax.
@@ -52,9 +60,11 @@ from torch import Tensor
 from text_vpa.models.realizers.paths import KappaSchedule, uniform_time_grid
 from text_vpa.stage0.backbone import PrefixCache, Stage0Realizer
 
-__all__ = ["ORDERS", "RealizeResult", "SamplerConfig", "draw_tokens", "realize", "reveal_counts"]
+__all__ = ["ORDERS", "TIME_INPUTS", "RealizeResult", "SamplerConfig", "draw_tokens", "network_time", "realize",
+           "reveal_counts"]
 
 ORDERS: tuple[str, ...] = ("random", "confidence", "left_to_right")
+TIME_INPUTS: tuple[str, ...] = ("schedule", "matched")
 
 
 @dataclass(frozen=True)
@@ -66,10 +76,14 @@ class SamplerConfig:
     top_p: float = 0.95
     top_k: int = 1024
     chunk: int = 512               # positions whose logits are held at once
+    time_input: str = "schedule"   # "schedule": t = k/K, h = 1/K; "matched": a (t, h) pair seen in training
+    time_grid: int = 8             # the finest trained step budget (matched: t on its grid, h = 1/time_grid)
 
     def __post_init__(self) -> None:
         if self.num_steps < 1 or self.order not in ORDERS:
             raise ValueError(f"need num_steps >= 1 and order in {ORDERS}")
+        if self.time_input not in TIME_INPUTS or self.time_grid < 1:
+            raise ValueError(f"need time_input in {TIME_INPUTS} and time_grid >= 1")
         if self.temperature < 0 or not 0 < self.top_p <= 1 or self.top_k < 1:
             raise ValueError("need temperature >= 0, 0 < top_p <= 1 and top_k >= 1")
 
@@ -116,6 +130,21 @@ def reveal_counts(masked: Tensor, pi: float, last: bool) -> Tensor:
         return masked.clone()
     count = torch.round(masked.double() * pi).long().clamp(min=1)
     return torch.minimum(count, masked)
+
+
+def network_time(cfg: SamplerConfig, schedule: KappaSchedule, t: float, h: float, masked: Tensor
+                 ) -> tuple[Tensor, Tensor]:
+    """The (t, h) given to the network at a step, ``[B]`` each (see the module docstring).
+
+    ``masked`` is ``[B, N]`` bool, the canvas before the step's reveal.
+    """
+    b, device = masked.shape[0], masked.device
+    if cfg.time_input == "schedule":
+        return torch.full((b,), t, device=device), torch.full((b,), h, device=device)
+    grid = torch.arange(cfg.time_grid, device=device, dtype=torch.float32) / cfg.time_grid     # t seen in training
+    revealed = 1.0 - masked.float().mean(dim=1)                                                # [B]
+    nearest = (schedule.kappa(grid)[None, :] - revealed[:, None]).abs().argmin(dim=1)
+    return grid[nearest], torch.full((b,), 1.0 / cfg.time_grid, device=device)
 
 
 def _draw_in_chunks(realizer: Stage0Realizer, hidden: Tensor, cfg: SamplerConfig, forbidden: Sequence[int],
@@ -169,10 +198,10 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
     for k, (t, h) in enumerate(grid):
         last = k == len(grid) - 1
         masked = tokens == mask_id
+        t_in, h_in = network_time(cfg, schedule, t, h, masked)
         hidden = realizer.canvas_hidden(
-            cache, torch.cat([anchor[:, None], tokens], dim=1), torch.cat([front, masked], dim=1),
-            torch.full((b,), t, device=device), torch.full((b,), h, device=device), mode=mode,
-            adapters=adapters,
+            cache, torch.cat([anchor[:, None], tokens], dim=1), torch.cat([front, masked], dim=1), t_in, h_in,
+            mode=mode, adapters=adapters,
         )[:, :canvas_len]                                           # index j predicts canvas token j + 1
         pi = 1.0 if last else float(schedule.exact_jump_mass(t, h))
         if cfg.order == "random":

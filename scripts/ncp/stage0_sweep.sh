@@ -11,7 +11,10 @@
 #                            If it does not, there is a bug and every Stage 0 number has to be redone.
 #   2. cost of the adaptation  the trained realizer, left_to_right at K = 256, against the code check. Training
 #                            used uniformly random masks and never a revealed prefix with a masked suffix, so part
-#                            of this cost can be that mismatch.
+#                            of this cost can be that mismatch. It also gave the network only (t, h) pairs with t a
+#                            multiple of 1/8 and h in {1/2, 1/4, 1/8}; K = 256 gives h = 1/256, far outside them.
+#                            The same run with --time-input matched (a training pair: h = 1/8, t matched to the
+#                            fraction already revealed) separates the two.
 #   3. cost of parallel decisions  the trained realizer at fewer steps: left_to_right at K = 128 (one token per
 #                            step for the first 42 positions, then 2 to 3) and K = 8 (blocks of 5, 15, 24, 32), and
 #                            the exact jump kernel, the confidence order and left_to_right at K = 8, 32, 128.
@@ -71,22 +74,27 @@ run() {
   local realizer=(--decoder realizer --checkpoint "$RUN/last.pt")
   log "sweep: MBPP validation, $NUM_SAMPLES samples per problem, K = ${ks[*]}"
 
-  log "1/6 baseline, the released model's own generate"
+  log "1/7 baseline, the released model's own generate"
   "$PY" -m text_vpa.stage0.evaluate --decoder ar --canvas-len 256 "${common[@]}"
-  log "2/6 code check: the backbone through the realizer's code path (adapters off, causal, one token per step)"
+  log "2/7 code check: the backbone through the realizer's code path (adapters off, causal, one token per step)"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 256 --orders left_to_right --canvas-mode causal \
     --no-adapters "${common[@]}"
   summarize
-  log "3/6 cost of the adaptation: the trained realizer, one token per step"
+  log "3/7 cost of the adaptation: the trained realizer, one token per step"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 256 --orders left_to_right "${common[@]}"
   summarize
-  log "4/6 the trained realizer, left_to_right at K = 128 and K = 8"
+  log "4/7 the same with (t, h) as seen in training, and the exact jump kernel at K = 32 likewise"
+  "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 256 --orders left_to_right --time-input matched \
+    "${common[@]}"
+  "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 32 --orders random --time-input matched "${common[@]}"
+  summarize
+  log "5/7 the trained realizer, left_to_right at K = 128 and K = 8"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 128 8 --orders left_to_right "${common[@]}"
   summarize
-  log "5/6 the trained realizer, exact jump kernel and confidence order at K = ${ks[*]}"
+  log "6/7 the trained realizer, exact jump kernel and confidence order at K = ${ks[*]}"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps "${ks[@]}" --orders random confidence "${common[@]}"
   summarize
-  log "6/6 the trained realizer, left_to_right at K = ${ks[*]}"
+  log "7/7 the trained realizer, left_to_right at K = ${ks[*]}"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps "${ks[@]}" --orders left_to_right "${common[@]}"
   summarize
   log "sweep finished: $OUT/report.md, $OUT/analysis.md"

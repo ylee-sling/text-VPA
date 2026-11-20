@@ -182,7 +182,10 @@ was still falling slowly at every state (all-masked 4.26 -> 4.08 nats from step 
      number has to be redone.
   2. **Cost of the adaptation:** the trained realizer, `left_to_right` at K = 256 (one token per step), against
      the code check. Training used uniformly random masks and never a revealed prefix with a masked suffix, so
-     part of this cost can be that mismatch.
+     part of this cost can be that mismatch. Training also gave the network only (t, h) pairs with t a multiple
+     of 1/8 and h in {1/2, 1/4, 1/8}, entered as sinusoidal features of 1000 t and 1000 h; K = 256 gives
+     h = 1/256 (3.9 against 125 to 500). The same run with `--time-input matched` (h = 1/8 and the grid time
+     whose kappa_t matches the fraction already revealed: a pair seen in training) separates the two.
   3. **Cost of parallel decisions:** the trained realizer at fewer steps: `left_to_right` at K = 128 (one token
      per step for the first 42 positions, then 2 to 3) and K = 8 (blocks of 5, 15, 24, 32), and all three orders
      at K = 8, 32, 128.

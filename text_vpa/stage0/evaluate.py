@@ -38,7 +38,7 @@ from text_vpa.stage0.autoregressive import cut_at_eos, generate_autoregressive
 from text_vpa.stage0.backbone import RealizerSpec, Stage0Realizer, left_pad, load_gemma4
 from text_vpa.stage0.data import HFTokenizer, Stage0Tokenizer, mbpp_prompt
 from text_vpa.stage0.postprocess import build_sample, is_complete, parses
-from text_vpa.stage0.sampler import ORDERS, SamplerConfig, realize
+from text_vpa.stage0.sampler import ORDERS, TIME_INPUTS, SamplerConfig, realize
 from text_vpa.utils.device import resolve_device
 
 __all__ = ["load_tasks", "prompt_text", "realizer_samples", "score", "write_results"]
@@ -249,6 +249,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--chat", action="store_true", help="ar only: prompt through the chat template")
     p.add_argument("--canvas-mode", choices=("bidirectional", "causal"), default="bidirectional",
                    help="realizer only: the canvas's attention masks")
+    p.add_argument("--time-input", choices=TIME_INPUTS, default="schedule",
+                   help="realizer only: the (t, h) given to the network; matched: a pair seen in training")
     p.add_argument("--no-adapters", action="store_true",
                    help="realizer only: LoRA and modulation off; with --canvas-mode causal and left_to_right at "
                         "K = N this is the backbone's own decoding through the realizer's code path")
@@ -299,9 +301,11 @@ def main(argv: list[str] | None = None) -> int:
             for k_steps in args.k_steps:
                 tag = (f"realizer-K{k_steps}" + ("" if order == "random" else f"-{order}")
                        + ("-causal" if args.canvas_mode == "causal" else "")
-                       + ("-no_adapters" if args.no_adapters else ""))
+                       + ("-no_adapters" if args.no_adapters else "")
+                       + ("-matched_time" if args.time_input == "matched" else ""))
                 configs.append((tag, SamplerConfig(k_steps, schedule, order, args.temperature, args.top_p,
-                                                   args.top_k)))
+                                                   args.top_k, time_input=args.time_input,
+                                                   time_grid=max(ckpt["config"]["step_budgets"]))))
 
     for benchmark in args.benchmarks:
         tasks = load_tasks(benchmark, args.eval_dir, args.mbpp_split, args.limit)
