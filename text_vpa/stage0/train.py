@@ -34,8 +34,9 @@ The same evaluation also measures one-token-per-step decoding on the held-out fu
 state with a fixed first masked position L per function, ``val_loss_next`` is the realizer's loss on token L
 (what ``left_to_right`` at K = N samples from) and ``val_loss_next_backbone`` the frozen backbone's own
 next-token loss on the same tokens (adapters off, causal canvas: its autoregressive prediction, computed once).
-Their difference, in nats per token, is the cost of the adaptation at one token per step; ``val_loss_prefix`` is
-the loss on every masked position of those states.
+Their difference is a check that one-token-per-step prediction trains, not a forecast of Pass@1: the first run's
+realizer was below its backbone on it from step 2,500 (1.03 against 1.19 nats) while keeping 36% of its Pass@1
+at one token per step (docs/stage0.md). ``val_loss_prefix`` is the loss on every masked position of those states.
 """
 
 from __future__ import annotations

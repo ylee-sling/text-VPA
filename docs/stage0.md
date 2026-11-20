@@ -146,9 +146,10 @@ Each line: the choice, the reason, and the alternative that was not taken.
     rho_1 >= 0.8, fails at rho_1 <= 0.5, partial in between; "clearly" when the 95% paired-bootstrap interval
     lies on the same side. At one token per step nothing is decided in parallel, so the ratio is the cost of the
     adaptation alone. 0.5 is below the estimate for the first run without its data flaw (0.58), so a fail means
-    prefix-shaped states added nothing. It is read with two other numbers: the def-line table (bad and copied
-    `def` lines at the baseline's 0%) and the held-out next-token loss against the backbone's
-    (`val_loss_next`, `val_loss_next_backbone`). Rows at K <= 128 are read after it.
+    prefix-shaped states added nothing. It is read with the def-line table (bad and copied `def` lines at the
+    baseline's 0%). The held-out next-token loss (`val_loss_next`) is a training check only: the first run's
+    realizer was below its backbone on it while keeping 36% of its Pass@1 (see "The second run"). Rows at
+    K <= 128 are read after the gate.
 
 ## Gemma 4 E2B: what was checked on 17 Nov 2026
 
@@ -279,9 +280,23 @@ half of the training states are prefix-shaped (decision 21). A validation run co
 - **Training:** from the released checkpoint (not from the first run's adapters, which carry the copying),
   10,000 steps of 32 examples, otherwise the first run's recipe. About 14 h on the L4.
 - **While it trains:** every 2,500 steps the held-out next-token loss in prefix states, `val_loss_next`, next to
-  the frozen backbone's own on the same tokens, `val_loss_next_backbone`. The difference is the cost of the
-  adaptation at one token per step in nats per token, at the price of one validation pass
-  (`bash scripts/ncp/stage0.sh status` prints the curve).
+  the frozen backbone's own on the same tokens, `val_loss_next_backbone` (`bash scripts/ncp/stage0.sh status`
+  prints the curve). It is a check that training works, not a forecast of the gate. Measured on the first run's
+  checkpoints before the second run started (20 Nov, same 256 functions, same positions):
+
+  | step | 2,500 | 5,000 | 7,500 | 10,000 | 25,000 |
+  |---|---|---|---|---|---|
+  | first run, `val_loss_next` (nats) | 1.028 | 1.075 | 1.066 | 1.071 | 0.990 |
+  | first run, next-token accuracy | 76.2% | 73.8% | 73.4% | 75.4% | 77.3% |
+
+  The backbone: 1.187 nats, 71.5%. The first run's realizer predicted the next token in prefix-shaped states
+  *better* than its backbone from step 2,500 on, without prefix-shaped training, yet kept 36% of its Pass@1 at
+  one token per step (about 58% without the data flaw). So this loss does not measure what Pass@1 loses: part of
+  the realizer's lead is the corpus format it was trained on (the `<eos>` after the function, which the backbone
+  does not expect), and a mean over tokens hides the rare token that breaks a program. If the second run's curve
+  matches the first run's, prefix-shaped states did not change next-token prediction, and a gain at the gate
+  belongs mostly to the data fix; separating the two would take a run with the fix alone (`prefix_fraction` = 0).
+  A curve above the backbone's 1.187 would mean something broke.
 - **After training,** on MBPP's validation split (90 problems, 5 samples), in this order: the trained realizer at
   one token per step; the code check; left to right at K = 8, 32, 128; the exact kernel and the confidence order
   at K = 8, 32, 128; the baseline; and as a control the rows with (t, h) as in training. `RUN/sweep/report.md`
