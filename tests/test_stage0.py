@@ -400,10 +400,12 @@ class ScriptedRealizer:
         self.script = torch.tensor(script)
         self.vocab = vocab
         self.masks: list[torch.Tensor] = []
+        self.calls: list[tuple[str, bool]] = []
 
-    def canvas_hidden(self, cache, canvas_ids, is_mask, t, h, mode="bidirectional"):
+    def canvas_hidden(self, cache, canvas_ids, is_mask, t, h, mode="bidirectional", adapters=True):
         self.passes["canvas"] += 1
         self.masks.append(is_mask[:, 1:].clone())
+        self.calls.append((mode, adapters))
         b, c = canvas_ids.shape
         hidden = torch.zeros(b, c, self.vocab)
         hidden[:, : len(self.script)] = torch.nn.functional.one_hot(self.script, self.vocab).float()
@@ -454,6 +456,73 @@ def test_realizer_samples_reports_the_depth_rows_needed():
     # One token per pass at K = 12, N = 12; the <eos> at position 3 is revealed by the third pass, then the stop.
     assert info["mean_sequential_depth"] == info["sequential_depth"] == 4
     assert info["mean_revealed_per_step"] == [1.0, 1.0, 1.0] + [0.0] * 9
+
+
+def test_row_done_stops_a_row_without_changing_its_program():
+    """The truncation rule's stop, found in the revealed prefix, fixes the program: stopping there gives the same
+    program as decoding the whole canvas (``realizer_samples`` with a prefix check every 8 steps)."""
+    tok = CharTokenizer()
+    script = tok.encode_batch(["    return 1\nprint(f(1))\n" + "#" * 6])[0]          # no <eos> anywhere
+    n = len(script)
+    humaneval, _ = _tasks()
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    outputs = {}
+    for order in ("left_to_right", "random"):
+        realizer = ScriptedRealizer(script, vocab=VOCAB)
+        realizer.prefill = lambda *args: Cache()                      # type: ignore[attr-defined]
+        texts, info = realizer_samples(realizer, tok, [humaneval], "humaneval",
+                                       SamplerConfig(num_steps=n, schedule="linear", order=order), canvas_len=n,
+                                       num_samples=2, batch_size=2, seed=0, device=torch.device("cpu"))
+        outputs[order] = (texts[0], info, realizer.passes["canvas"])
+    stopped, info, passes = outputs["left_to_right"]
+    full, _, full_passes = outputs["random"]                          # all n steps, the whole canvas revealed
+    assert full_passes == n and passes == 16 < n                      # "p" revealed at step 14, checked at 16
+    assert stopped != full and [build_sample(humaneval, "humaneval", t) for t in stopped] == \
+        [build_sample(humaneval, "humaneval", t) for t in full] == [humaneval.context + "    return 1\n"] * 2
+    assert info["mean_sequential_depth"] == 17.0 and info["canvas_mode"] == "bidirectional" and info["adapters"]
+
+
+def test_backbone_mode_of_the_sampler_is_greedy_generate():
+    """Adapters off, causal masks, one token per step, temperature 0: the realizer's sampler is the backbone's own
+    greedy decoding. The server check of the real model relies on this; here it is transformers' ``generate``."""
+    realizer, reference = tiny_realizer(seed=1)
+    randomize_adapters(realizer)                                      # must not matter: the adapters are off
+    prompt, n = [2, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69], 12
+    reference.generation_config.eos_token_id = 1
+    with torch.no_grad():
+        out = reference.generate(torch.tensor([prompt]), max_new_tokens=n, do_sample=False,
+                                 suppress_tokens=[MASK, 0, 2], pad_token_id=0)
+    want = cut_at_eos(out[0, len(prompt):].tolist(), [1])
+    cfg = SamplerConfig(num_steps=n, schedule="linear", order="left_to_right", temperature=0.0)
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([prompt[:-1]], 0))
+        result = realize(realizer, cache, torch.tensor([prompt[-1]]), n, cfg, forbidden=[0, 2], mode="causal",
+                         adapters=False, stop_id=1)
+    assert result.revealed[:len(want)] == [1] * len(want)              # one token per step
+    assert cut_at_eos(result.tokens[0].tolist(), [1]) == want and len(want) >= 3
+
+
+def test_realizer_samples_passes_the_canvas_mode_and_adapters():
+    realizer = ScriptedRealizer([10, 11, 1] + [20] * 5)
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    realizer.prefill = lambda *args: Cache()                          # type: ignore[attr-defined]
+    task, _ = _tasks()
+    _, info = realizer_samples(realizer, CharTokenizer(), [task], "humaneval",
+                               SamplerConfig(num_steps=8, schedule="linear", order="left_to_right"), canvas_len=8,
+                               num_samples=1, batch_size=1, seed=0, device=torch.device("cpu"), mode="causal",
+                               adapters=False)
+    assert set(realizer.calls) == {("causal", False)} and info["canvas_mode"] == "causal" and not info["adapters"]
+    with pytest.raises(ValueError, match="stop_id"):
+        realize(realizer, None, torch.tensor([9]), 8, SamplerConfig(order="left_to_right"),
+                row_done=lambda tokens: torch.zeros(1, dtype=torch.bool))
 
 
 # =============================================================================================

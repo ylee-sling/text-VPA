@@ -2,22 +2,26 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 #
-# stage0_sweep.sh -- a diagnostic after Stage 0, outside the protocol: the trained realizer with three samplers
-# and more steps than the depth budget allows, on MBPP's validation split (90 problems; the test sets stay
-# untouched).
+# stage0_sweep.sh -- a diagnostic after Stage 0, outside the protocol, on MBPP's validation split (90 problems;
+# the test sets stay untouched). It splits the realizer's gap to the baseline into three parts:
+#
+#   1. code check            the realizer's code path with the adapters off, causal masks and left_to_right at
+#                            K = 256 (exactly one token per step) is the backbone's own decoding: it must match
+#                            the baseline (on the tiny Gemma 4 it reproduces greedy `generate` token for token).
+#                            If it does not, there is a bug and every Stage 0 number has to be redone.
+#   2. cost of the adaptation  the trained realizer, left_to_right at K = 256, against the code check. Training
+#                            used uniformly random masks and never a revealed prefix with a masked suffix, so part
+#                            of this cost can be that mismatch.
+#   3. cost of parallel decisions  the trained realizer at fewer steps: left_to_right at K = 128 (one token per
+#                            step for the first 42 positions, then 2 to 3) and K = 8 (blocks of 5, 15, 24, 32), and
+#                            the exact jump kernel, the confidence order and left_to_right at K = 8, 32, 128.
+#
+# The realizer was trained at t = k/K and h = 1/K for K in {2, 4, 8} only, so K > 8 also feeds it (t, h) values
+# it has never seen. A left-to-right row stops at its <eos> or once the truncation rule has found its stop in the
+# revealed prefix; neither changes the program.
 #
 #   bash scripts/ncp/stage0_sweep.sh          start in a detached tmux session ("<run>-sweep") and return
 #   bash scripts/ncp/stage0_sweep.sh run      run in the foreground
-#
-# It answers what kind of failure H2 is.
-#   1. left_to_right at K = 128 reveals one token per step for the first 52 tokens: close to the adapted model
-#      decoding autoregressively. Near the baseline: the implementation and the adaptation are sound, and the
-#      failure is parallel realization. Far below it: the adaptation (or the code) is at fault; look there first.
-#   2. left_to_right at K = 8 is a semi-autoregressive sampler inside the depth budget (blocks of 5, 15, 24, 32
-#      tokens from the left).
-#   3. random (the exact jump kernel) and confidence at K = 8, 32, 128: how fast quality rises with the steps.
-# Caveat: the realizer was trained at t = k/K and h = 1/K for K in {2, 4, 8} only, so K > 8 also feeds it
-# (t, h) values it has never seen.
 #
 # Results: RUN/sweep/report.md (Pass@1 table) and RUN/sweep/analysis.md (how the samples failed), both rewritten
 # after each stage, so partial results can be read while the sweep runs. Rerunning skips finished configurations.
@@ -67,15 +71,22 @@ run() {
   local realizer=(--decoder realizer --checkpoint "$RUN/last.pt")
   log "sweep: MBPP validation, $NUM_SAMPLES samples per problem, K = ${ks[*]}"
 
-  log "1/4 baseline, left to right"
+  log "1/6 baseline, the released model's own generate"
   "$PY" -m text_vpa.stage0.evaluate --decoder ar --canvas-len 256 "${common[@]}"
-  log "2/4 realizer, left_to_right at K = 128 (about one token per step) and K = 8"
+  log "2/6 code check: the backbone through the realizer's code path (adapters off, causal, one token per step)"
+  "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 256 --orders left_to_right --canvas-mode causal \
+    --no-adapters "${common[@]}"
+  summarize
+  log "3/6 cost of the adaptation: the trained realizer, one token per step"
+  "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 256 --orders left_to_right "${common[@]}"
+  summarize
+  log "4/6 the trained realizer, left_to_right at K = 128 and K = 8"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps 128 8 --orders left_to_right "${common[@]}"
   summarize
-  log "3/4 realizer, exact jump kernel and confidence order at K = ${ks[*]}"
+  log "5/6 the trained realizer, exact jump kernel and confidence order at K = ${ks[*]}"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps "${ks[@]}" --orders random confidence "${common[@]}"
   summarize
-  log "4/4 realizer, left_to_right at K = ${ks[*]}"
+  log "6/6 the trained realizer, left_to_right at K = ${ks[*]}"
   "$PY" -m text_vpa.stage0.evaluate "${realizer[@]}" --k-steps "${ks[@]}" --orders left_to_right "${common[@]}"
   summarize
   log "sweep finished: $OUT/report.md, $OUT/analysis.md"

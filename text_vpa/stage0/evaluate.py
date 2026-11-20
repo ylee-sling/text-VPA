@@ -70,11 +70,26 @@ def autocast(device: torch.device) -> Any:
 
 def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks: Sequence[EvalTask],
                      benchmark: str, cfg: SamplerConfig, canvas_len: int, num_samples: int, batch_size: int,
-                     seed: int, device: torch.device, progress: bool = False) -> tuple[list[list[str]], dict]:
-    """``num_samples`` canvases per task, decoded up to their first <eos>."""
+                     seed: int, device: torch.device, progress: bool = False, mode: str = "bidirectional",
+                     adapters: bool = True) -> tuple[list[list[str]], dict]:
+    """``num_samples`` canvases per task, decoded up to their first <eos>.
+
+    ``mode`` and ``adapters``: the canvas masks and whether LoRA and modulation act (``causal`` without adapters
+    is the backbone's own decoding through this code path). A left-to-right row stops at its <eos>, or once the
+    truncation rule has found its stop in the revealed prefix; neither changes the program.
+    """
     texts: list[list[str]] = []
     forbidden = [tokenizer.pad_id, tokenizer.bos_id]
     stop_id = tokenizer.eos_id if cfg.order == "left_to_right" else None
+    kind = "complete" if benchmark == "humaneval" else "write"
+
+    def row_done(tokens: torch.Tensor) -> torch.Tensor:
+        done = []
+        for row in tokens.tolist():
+            prefix = cut_at_eos(row, [tokenizer.eos_id, realizer.spec.mask_id])
+            done.append(is_complete(tokenizer.decode(prefix), kind))
+        return torch.tensor(done, dtype=torch.bool)
+
     seconds, tokens_out, depth, row_passes = 0.0, 0, 0, 0
     revealed = [0] * cfg.num_steps
     for index, task in enumerate(tasks):
@@ -88,7 +103,8 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
                 n = min(batch_size, num_samples - len(rows))
                 anchor = torch.full((n,), ids[-1], dtype=torch.long, device=device)
                 result = realize(realizer, cache.expand(n), anchor, canvas_len, cfg, forbidden, generator,
-                                 stop_id=stop_id)
+                                 mode=mode, stop_id=stop_id, adapters=adapters,
+                                 row_done=row_done if stop_id is not None else None)
                 depth = max(depth, result.sequential_depth)
                 row_passes += int(result.row_passes.sum())
                 for step, count in enumerate(result.revealed):
@@ -104,7 +120,8 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
         if progress and (index + 1) % 20 == 0:
             print(f"  generated {index + 1}/{len(tasks)} problems", file=sys.stderr, flush=True)
     total = max(len(tasks) * num_samples, 1)
-    info = {"decoder": "realizer", **cfg.to_dict(), "canvas_len": canvas_len, "sequential_depth": depth,
+    info = {"decoder": "realizer", **cfg.to_dict(), "canvas_mode": mode, "adapters": adapters,
+            "canvas_len": canvas_len, "sequential_depth": depth,
             "mean_sequential_depth": round(1 + row_passes / total, 2),
             "generation_seconds": round(seconds, 3), "mean_tokens": round(tokens_out / total, 2),
             "mean_revealed_per_step": [round(r / total, 2) for r in revealed]}
@@ -230,6 +247,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=1024)
     p.add_argument("--batch-size", type=int, default=10)
     p.add_argument("--chat", action="store_true", help="ar only: prompt through the chat template")
+    p.add_argument("--canvas-mode", choices=("bidirectional", "causal"), default="bidirectional",
+                   help="realizer only: the canvas's attention masks")
+    p.add_argument("--no-adapters", action="store_true",
+                   help="realizer only: LoRA and modulation off; with --canvas-mode causal and left_to_right at "
+                        "K = N this is the backbone's own decoding through the realizer's code path")
     p.add_argument("--tag-suffix", default="")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--timeout", type=float, default=10.0)
@@ -275,7 +297,9 @@ def main(argv: list[str] | None = None) -> int:
         common.update(checkpoint=str(args.checkpoint), step=ckpt["step"], schedule=schedule)
         for order in args.orders:
             for k_steps in args.k_steps:
-                tag = f"realizer-K{k_steps}" + ("" if order == "random" else f"-{order}")
+                tag = (f"realizer-K{k_steps}" + ("" if order == "random" else f"-{order}")
+                       + ("-causal" if args.canvas_mode == "causal" else "")
+                       + ("-no_adapters" if args.no_adapters else ""))
                 configs.append((tag, SamplerConfig(k_steps, schedule, order, args.temperature, args.top_p,
                                                    args.top_k)))
 
@@ -298,7 +322,8 @@ def main(argv: list[str] | None = None) -> int:
                                                      CHAT_MAX_NEW_TOKENS if args.chat else canvas_len)
             else:
                 texts, info = realizer_samples(realizer, tokenizer, tasks, benchmark, cfg, canvas_len,
-                                               args.num_samples, args.batch_size, args.seed, device, progress=True)
+                                               args.num_samples, args.batch_size, args.seed, device, progress=True,
+                                               mode=args.canvas_mode, adapters=not args.no_adapters)
             summary, rows = score(tasks, benchmark, texts, args.k, args.chat, args.timeout, args.exec_workers)
             summary = {**summary, "split": args.mbpp_split if benchmark == "mbpp" else "test", "tag": tag,
                        **info, **common}

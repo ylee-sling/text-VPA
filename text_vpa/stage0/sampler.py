@@ -22,10 +22,16 @@ of positions, round(pi * masked), but takes the ones whose drawn token has the h
 
 ``order="left_to_right"`` (a diagnostic, semi-autoregressive) reveals the same number of positions as the
 confidence order, but always the leftmost masked ones. With the cosine schedule and N = 256 that is blocks of
-5, 15, 24, 32, ... tokens at K = 8, and one token per step for the first 52 tokens at K = 128: close to the
-adapted model decoding autoregressively. With ``stop_id`` it stops once every row has revealed that token (its
+5, 15, 24, 32, ... tokens at K = 8; one token per step for the first 42 positions, then 2 to 3, at K = 128;
+and exactly one token per step for all 256 positions at K = 256: the adapted model decoding autoregressively. With ``stop_id`` it stops once every row has revealed that token (its
 <eos>): revealed positions never change and everything after the first <eos> is discarded, so the output is the
-same as without the stop; only passes that cannot change it are skipped.
+same as without the stop; only passes that cannot change it are skipped. ``row_done`` (checked every
+``check_every`` steps) can end a row earlier, e.g. once the truncation rule has found its stop in the revealed
+prefix, which likewise fixes the program.
+
+``adapters=False`` with ``mode="causal"`` and one token per step is the frozen backbone's own autoregressive
+decoding, computed through this code path: the check that the realizer's implementation reproduces the
+baseline on the real model.
 
 Token draw (both orders, and the autoregressive baseline through ``generate``): temperature, then the
 ``top_k`` most probable tokens, then the smallest nucleus of mass >= ``top_p`` among them. temperature 0 is the
@@ -37,7 +43,7 @@ Depth: one prefill of the prompt by the frozen backbone and K canvas passes, K +
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 
 import torch
@@ -129,7 +135,8 @@ def _draw_in_chunks(realizer: Stage0Realizer, hidden: Tensor, cfg: SamplerConfig
 @torch.no_grad()
 def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas_len: int, cfg: SamplerConfig,
             forbidden: Sequence[int] = (), generator: torch.Generator | None = None,
-            mode: str = "bidirectional", stop_id: int | None = None) -> RealizeResult:
+            mode: str = "bidirectional", stop_id: int | None = None, adapters: bool = True,
+            row_done: Callable[[Tensor], Tensor] | None = None, check_every: int = 8) -> RealizeResult:
     """K parallel steps from the all-[MASK] canvas.
 
     Args:
@@ -140,7 +147,12 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         generator: on the realizer's device.
         stop_id: left-to-right order only: stop once every row has revealed this token; the remaining positions
             are filled with it.
+        adapters: False runs the frozen backbone on the canvas (LoRA and modulation off).
+        row_done: left-to-right order only, needs ``stop_id``: ``[B, N]`` tokens (a revealed prefix, then [MASK])
+            -> ``[B]`` bool, True once a row's output is final; checked every ``check_every`` steps.
     """
+    if row_done is not None and stop_id is None:
+        raise ValueError("row_done needs stop_id (it fills the rest of a finished row)")
     mask_id = realizer.spec.mask_id
     device = anchor.device
     b = anchor.shape[0]
@@ -160,6 +172,7 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         hidden = realizer.canvas_hidden(
             cache, torch.cat([anchor[:, None], tokens], dim=1), torch.cat([front, masked], dim=1),
             torch.full((b,), t, device=device), torch.full((b,), h, device=device), mode=mode,
+            adapters=adapters,
         )[:, :canvas_len]                                           # index j predicts canvas token j + 1
         pi = 1.0 if last else float(schedule.exact_jump_mass(t, h))
         if cfg.order == "random":
@@ -186,7 +199,10 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         executed += 1
         if cfg.order == "left_to_right" and stop_id is not None and not last:
             # Revealed positions are a prefix, so a revealed stop token ends the row's output.
-            now = (tokens == stop_id).any(dim=1) & ~stopped
+            now = (tokens == stop_id).any(dim=1)
+            if row_done is not None and (k + 1) % check_every == 0:
+                now = now | row_done(tokens).to(device)
+            now = now & ~stopped
             row_passes[now] = k + 1
             stopped |= now
             if bool(stopped.all()):

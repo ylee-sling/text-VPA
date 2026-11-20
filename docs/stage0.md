@@ -174,14 +174,21 @@ was still falling slowly at every state (all-masked 4.26 -> 4.08 nats from step 
 - `python -m text_vpa.stage0.analyze --eval RUN/eval` sorts every sample into passed, empty, syntax error, wrong
   answer, runtime error or timeout, lists the most frequent syntax errors, and counts adjacent repeated
   identifiers (a symptom of positions decided in parallel from the same context).
-- `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates the trained realizer on MBPP's validation split,
-  next to the baseline on the same split; outside the protocol, no verdict. First `left_to_right` at K = 128,
-  which reveals one token per step for the first 52 tokens: close to the adapted model decoding
-  autoregressively. Near the baseline, the implementation and the adaptation are sound and the failure is
-  parallel realization; far below it, look at the adaptation (or the code) first. Then `left_to_right` at
-  K = 8 (semi-autoregressive blocks of 5, 15, 24, 32 tokens, inside the depth budget), and all three orders at
-  K = 8, 32, 128. The realizer was trained only at the (t, h) values of K in {2, 4, 8}, so K > 8 is also off its
-  training distribution.
+- `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates on MBPP's validation split, next to the baseline
+  on the same split; outside the protocol, no verdict. It splits the gap to the baseline into three parts:
+  1. **Code check:** the realizer's code path with the adapters off, causal masks and `left_to_right` at
+     K = 256 (exactly one token per step) is the backbone's own decoding; it must match the baseline (on the tiny
+     Gemma 4 it reproduces greedy `generate` token for token). If it does not, there is a bug and every Stage 0
+     number has to be redone.
+  2. **Cost of the adaptation:** the trained realizer, `left_to_right` at K = 256 (one token per step), against
+     the code check. Training used uniformly random masks and never a revealed prefix with a masked suffix, so
+     part of this cost can be that mismatch.
+  3. **Cost of parallel decisions:** the trained realizer at fewer steps: `left_to_right` at K = 128 (one token
+     per step for the first 42 positions, then 2 to 3) and K = 8 (blocks of 5, 15, 24, 32), and all three orders
+     at K = 8, 32, 128.
+  The realizer was trained only at the (t, h) values of K in {2, 4, 8}, so K > 8 is also off its training
+  distribution. A left-to-right row stops at its `<eos>` or once the truncation rule has found its stop in the
+  revealed prefix; neither changes the program.
 
 - `report.md` lists Pass@1, Pass@10, the fraction of programs that parse, the sequential depth and the mean
   number of tokens for every configuration, then the H2 verdict with its intervals and the learning curve.
