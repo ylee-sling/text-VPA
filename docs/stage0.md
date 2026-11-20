@@ -102,8 +102,10 @@ Each line: the choice, the reason, and the alternative that was not taken.
     imports + the function without its docstring. Prompts over 512 tokens are dropped.
 14. **Sampler.** Primary, and the one H2 is decided on: the exact jump kernel on the mask source, i.e. each masked
     position is revealed with probability pi_{t,h}, positions chosen at random. Secondary, reported next to it:
-    the same number of positions per step, most confident first (MaskGIT). Token draw for both decoders:
-    temperature 0.2, top-k 1,024, top-p 0.95; [MASK], `<pad>` and `<bos>` are never drawn.
+    the same number of positions per step, most confident first (MaskGIT). A third order for diagnostics only,
+    `left_to_right`: the same number of positions per step, leftmost first, stopping once a row's `<eos>` is
+    revealed (which changes no output). Token draw for both decoders: temperature 0.2, top-k 1,024,
+    top-p 0.95; [MASK], `<pad>` and `<bos>` are never drawn.
 15. **Baseline.** The released model's own `generate` (`Gemma4ForConditionalGeneration`, KV cache): same prompt,
     same 256-token budget, same draw, same truncation. It stops early once the truncation rule has found its
     stop, which changes no program.
@@ -146,16 +148,40 @@ on Gemma 4's 26B MoE backbone with a causal encoder that fills a KV cache and a 
 denoises a 256-token canvas in up to 48 steps under uniform-state diffusion. It is the closest published design
 to the Text-VPA realizer and belongs in Sec. 2.
 
+## Result of the first run (17 to 19 Nov 2026, `runs/stage0` on the NCP L4)
+
+25,000 steps (about 35 h), final checkpoint, 10 samples per problem, temperature 0.2.
+
+| benchmark | decoder | Pass@1 | Pass@10 | parses | depth |
+|---|---|---|---|---|---|
+| HumanEval | autoregressive (pre-trained) | 23.8% | 32.3% | 93.5% | 99 |
+| HumanEval | realizer K = 2 / 4 / 8, exact kernel | 0.7 / 1.0 / 1.2% | 1.2 / 3.0 / 4.9% | 8.1 / 10.1 / 17.3% | 3 / 5 / 9 |
+| HumanEval | realizer K = 2 / 4 / 8, confidence | 0.7 / 0.9 / 1.0% | 1.2 / 1.2 / 1.2% | 7.3 / 7.5 / 7.3% | 3 / 5 / 9 |
+| HumanEval | instruction-tuned, chat (reference) | 74.4% | 82.3% | 89.7% | 343 |
+| MBPP | autoregressive (pre-trained) | 26.7% | 43.8% | 90.4% | 116 |
+| MBPP | realizer K = 2 / 4 / 8, exact kernel | 0.0 / 0.1 / 0.2% | 0.0 / 0.8 / 1.2% | 0.7 / 3.0 / 7.3% | 3 / 5 / 9 |
+| MBPP | realizer K = 2 / 4 / 8, confidence | 0.0 / 0.0 / 0.0% | 0.0 / 0.0 / 0.0% | 0.5 / 0.7 / 1.5% | 3 / 5 / 9 |
+| MBPP | instruction-tuned, chat (reference) | 51.1% | 58.2% | 82.3% | 352 |
+
+**H2 clearly fails.** Pass@1 ratio of the realizer at K = 8 (exact kernel) to the autoregressive backbone:
+HumanEval 0.051 [0.011, 0.104], MBPP 0.006 [0.002, 0.012] (95% paired bootstrap over problems); threshold 0.5.
+The probe (MBPP validation, K = 8) stayed between 0.0% and 0.7% from step 5,000 to 25,000, and the held-out loss
+was still falling slowly at every state (all-masked 4.26 -> 4.08 nats from step 2,500 to 17,500; mostly revealed
+0.72 -> 0.53). The instruction-tuned row used its chat template and a 768-token budget; it is not part of H2.
+
 ## Reading the result
 
 - `python -m text_vpa.stage0.analyze --eval RUN/eval` sorts every sample into passed, empty, syntax error, wrong
   answer, runtime error or timeout, lists the most frequent syntax errors, and counts adjacent repeated
   identifiers (a symptom of positions decided in parallel from the same context).
-- `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates the trained realizer at K = 8, 16, 32, 64 and 128
-  with both samplers on MBPP's validation split, next to the baseline on the same split. It is outside the
-  protocol and has no verdict. If Pass@1 rises steeply with K, the denoiser is sound and the problem is
-  realizing in few steps; if even K = 128 stays poor, the adaptation itself is too weak. The realizer was
-  trained only at the (t, h) values of K in {2, 4, 8}, so K > 8 is also off its training distribution.
+- `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates the trained realizer on MBPP's validation split,
+  next to the baseline on the same split; outside the protocol, no verdict. First `left_to_right` at K = 128,
+  which reveals one token per step for the first 52 tokens: close to the adapted model decoding
+  autoregressively. Near the baseline, the implementation and the adaptation are sound and the failure is
+  parallel realization; far below it, look at the adaptation (or the code) first. Then `left_to_right` at
+  K = 8 (semi-autoregressive blocks of 5, 15, 24, 32 tokens, inside the depth budget), and all three orders at
+  K = 8, 32, 128. The realizer was trained only at the (t, h) values of K in {2, 4, 8}, so K > 8 is also off its
+  training distribution.
 
 - `report.md` lists Pass@1, Pass@10, the fraction of programs that parse, the sequential depth and the mean
   number of tokens for every configuration, then the H2 verdict with its intervals and the learning curve.

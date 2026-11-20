@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             s = summaries[tag_dir.name]
             table.append({"benchmark": bench_dir.name, "tag": tag_dir.name, "pass@1": s.get("pass@1"),
                           "pass@10": s.get("pass@10"), "parse_rate": s.get("parse_rate"),
-                          "depth": s.get("sequential_depth", s.get("mean_sequential_depth")),
+                          "depth": s.get("mean_sequential_depth", s.get("sequential_depth")),
                           "mean_tokens": s.get("mean_tokens"), "problems": s.get("problems"),
                           "samples": s.get("samples_per_problem")})
         if PRIMARY in summaries and BASELINE in summaries:

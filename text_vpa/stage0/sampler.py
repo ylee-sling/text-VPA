@@ -20,11 +20,19 @@ Because only jumping positions need a token, the S = 262,144 logits are computed
 of positions, round(pi * masked), but takes the ones whose drawn token has the highest posterior probability
 (at temperature 1), as in MaskGIT.
 
+``order="left_to_right"`` (a diagnostic, semi-autoregressive) reveals the same number of positions as the
+confidence order, but always the leftmost masked ones. With the cosine schedule and N = 256 that is blocks of
+5, 15, 24, 32, ... tokens at K = 8, and one token per step for the first 52 tokens at K = 128: close to the
+adapted model decoding autoregressively. With ``stop_id`` it stops once every row has revealed that token (its
+<eos>): revealed positions never change and everything after the first <eos> is discarded, so the output is the
+same as without the stop; only passes that cannot change it are skipped.
+
 Token draw (both orders, and the autoregressive baseline through ``generate``): temperature, then the
 ``top_k`` most probable tokens, then the smallest nucleus of mass >= ``top_p`` among them. temperature 0 is the
 argmax.
 
-Depth: one prefill of the prompt by the frozen backbone and K canvas passes, K + 1 sequential evaluations.
+Depth: one prefill of the prompt by the frozen backbone and K canvas passes, K + 1 sequential evaluations
+(fewer for a left-to-right row that has stopped).
 """
 
 from __future__ import annotations
@@ -38,22 +46,24 @@ from torch import Tensor
 from text_vpa.models.realizers.paths import KappaSchedule, uniform_time_grid
 from text_vpa.stage0.backbone import PrefixCache, Stage0Realizer
 
-__all__ = ["RealizeResult", "SamplerConfig", "draw_tokens", "realize", "reveal_counts"]
+__all__ = ["ORDERS", "RealizeResult", "SamplerConfig", "draw_tokens", "realize", "reveal_counts"]
+
+ORDERS: tuple[str, ...] = ("random", "confidence", "left_to_right")
 
 
 @dataclass(frozen=True)
 class SamplerConfig:
     num_steps: int = 8
     schedule: str = "cosine"
-    order: str = "random"          # "random": the exact jump kernel; "confidence": most confident first
+    order: str = "random"          # "random": the exact jump kernel; "confidence"; "left_to_right"
     temperature: float = 0.2
     top_p: float = 0.95
     top_k: int = 1024
     chunk: int = 512               # positions whose logits are held at once
 
     def __post_init__(self) -> None:
-        if self.num_steps < 1 or self.order not in ("random", "confidence"):
-            raise ValueError("need num_steps >= 1 and order in {'random', 'confidence'}")
+        if self.num_steps < 1 or self.order not in ORDERS:
+            raise ValueError(f"need num_steps >= 1 and order in {ORDERS}")
         if self.temperature < 0 or not 0 < self.top_p <= 1 or self.top_k < 1:
             raise ValueError("need temperature >= 0, 0 < top_p <= 1 and top_k >= 1")
 
@@ -64,9 +74,10 @@ class SamplerConfig:
 @dataclass
 class RealizeResult:
     tokens: Tensor                 # [B, N] int64, no [MASK]
-    revealed: list[int]            # positions revealed at each step (summed over the batch)
-    canvas_passes: int             # K
-    sequential_depth: int          # K + 1 (prefill + canvas passes)
+    revealed: list[int]            # positions revealed at each executed step (summed over the batch)
+    canvas_passes: int             # canvas passes executed for the batch: K, or fewer after a left-to-right stop
+    sequential_depth: int          # canvas_passes + 1 (prefill + canvas passes)
+    row_passes: Tensor             # [B] int64, canvas passes each row needed (K unless it stopped)
 
 
 def draw_tokens(logits: Tensor, temperature: float, top_p: float, top_k: int, forbidden: Sequence[int] = (),
@@ -118,7 +129,7 @@ def _draw_in_chunks(realizer: Stage0Realizer, hidden: Tensor, cfg: SamplerConfig
 @torch.no_grad()
 def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas_len: int, cfg: SamplerConfig,
             forbidden: Sequence[int] = (), generator: torch.Generator | None = None,
-            mode: str = "bidirectional") -> RealizeResult:
+            mode: str = "bidirectional", stop_id: int | None = None) -> RealizeResult:
     """K parallel steps from the all-[MASK] canvas.
 
     Args:
@@ -127,6 +138,8 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         canvas_len: N.
         forbidden: token ids that are never drawn in addition to [MASK] (e.g. <pad>, <bos>).
         generator: on the realizer's device.
+        stop_id: left-to-right order only: stop once every row has revealed this token; the remaining positions
+            are filled with it.
     """
     mask_id = realizer.spec.mask_id
     device = anchor.device
@@ -138,6 +151,9 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
     front = torch.zeros(b, 1, dtype=torch.bool, device=device)
     passes_before = realizer.passes["canvas"]
     revealed: list[int] = []
+    row_passes = torch.full((b,), cfg.num_steps, dtype=torch.long, device=device)
+    stopped = torch.zeros(b, dtype=torch.bool, device=device)
+    executed = 0
     for k, (t, h) in enumerate(grid):
         last = k == len(grid) - 1
         masked = tokens == mask_id
@@ -151,6 +167,11 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
             jump = masked if last else masked & (coin < pi)
             drawn, _ = _draw_in_chunks(realizer, hidden[jump], cfg, banned, generator)
             tokens[jump] = drawn
+        elif cfg.order == "left_to_right":
+            count = reveal_counts(masked.sum(dim=1), pi, last)
+            jump = masked & (masked.long().cumsum(dim=1) <= count[:, None])      # the leftmost `count` masked
+            drawn, _ = _draw_in_chunks(realizer, hidden[jump], cfg, banned, generator)
+            tokens[jump] = drawn
         else:
             drawn, prob = _draw_in_chunks(realizer, hidden[masked], cfg, banned, generator)
             score = torch.full(masked.shape, -1.0, device=device)
@@ -162,9 +183,18 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
             jump = masked & (rank < count[:, None])
             tokens = torch.where(jump, proposal, tokens)
         revealed.append(int(jump.sum()))
+        executed += 1
+        if cfg.order == "left_to_right" and stop_id is not None and not last:
+            # Revealed positions are a prefix, so a revealed stop token ends the row's output.
+            now = (tokens == stop_id).any(dim=1) & ~stopped
+            row_passes[now] = k + 1
+            stopped |= now
+            if bool(stopped.all()):
+                tokens = torch.where(tokens == mask_id, torch.full_like(tokens, stop_id), tokens)
+                break
     if bool((tokens == mask_id).any()):
         raise RuntimeError("positions are still [MASK] after the last step")
     canvas_passes = realizer.passes["canvas"] - passes_before
-    if canvas_passes != cfg.num_steps:
+    if canvas_passes != executed or (stop_id is None and canvas_passes != cfg.num_steps):
         raise RuntimeError(f"depth audit: {canvas_passes} canvas passes for K = {cfg.num_steps}")
-    return RealizeResult(tokens, revealed, canvas_passes, canvas_passes + 1)
+    return RealizeResult(tokens, revealed, canvas_passes, canvas_passes + 1, row_passes)

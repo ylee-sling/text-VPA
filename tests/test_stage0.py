@@ -350,7 +350,7 @@ def test_one_step_is_the_exact_jump_kernel_on_the_mask_source():
     assert sum(result.revealed) == rows * canvas_len
 
 
-@pytest.mark.parametrize("order", ["random", "confidence"])
+@pytest.mark.parametrize("order", ["random", "confidence", "left_to_right"])
 def test_realize_reveals_once_and_keeps_revealed_tokens(order):
     realizer, _ = tiny_realizer()
     randomize_adapters(realizer)
@@ -375,13 +375,85 @@ def test_realize_reveals_once_and_keeps_revealed_tokens(order):
         kept = before != MASK
         assert torch.equal(after[kept], before[kept])                 # revealed positions never change
     assert not bool(torch.isin(result.tokens, torch.tensor([MASK, 0, 2])).any())
-    if order == "confidence":                                         # round(pi * masked) per row, cosine kappa
+    if order == "left_to_right":                                      # revealed positions are always a prefix
+        for state in states:
+            masked = (state == MASK).long()
+            assert bool((masked[:, 1:] >= masked[:, :-1]).all())
+    if order in ("confidence", "left_to_right"):                      # round(pi * masked) per row, cosine kappa
         kappa = [1 - math.cos(math.pi * k / 16) for k in range(9)]
         masked = canvas_len
         for k in range(8):
             count = masked if k == 7 else max(1, round(masked * (kappa[k + 1] - kappa[k]) / (1 - kappa[k])))
             assert result.revealed[k] == rows * count
             masked -= count
+
+
+class ScriptedRealizer:
+    """A stand-in for ``Stage0Realizer`` whose posterior at canvas position j is (almost) all on ``script[j]``,
+    so what the sampler reveals, and when, can be checked exactly."""
+
+    def __init__(self, script: list[int], vocab: int = 40) -> None:
+        import types
+
+        self.spec = types.SimpleNamespace(mask_id=MASK)
+        self.passes = {"prefill": 0, "canvas": 0}
+        self.script = torch.tensor(script)
+        self.vocab = vocab
+        self.masks: list[torch.Tensor] = []
+
+    def canvas_hidden(self, cache, canvas_ids, is_mask, t, h, mode="bidirectional"):
+        self.passes["canvas"] += 1
+        self.masks.append(is_mask[:, 1:].clone())
+        b, c = canvas_ids.shape
+        hidden = torch.zeros(b, c, self.vocab)
+        hidden[:, : len(self.script)] = torch.nn.functional.one_hot(self.script, self.vocab).float()
+        return hidden                                                 # index j: the posterior of canvas token j
+
+    def logits(self, hidden):
+        return 40.0 * hidden
+
+
+def test_left_to_right_stop_skips_only_passes_that_cannot_change_the_output():
+    stop, n = 1, 16
+    script = [10, 11, 12, 13, 14, stop, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    cfg = SamplerConfig(num_steps=16, schedule="cosine", order="left_to_right", temperature=0.2)
+    full = ScriptedRealizer(script)
+    whole = realize(full, None, torch.full((3,), 9), n, cfg, generator=torch.Generator().manual_seed(0))
+    early = ScriptedRealizer(script)
+    short = realize(early, None, torch.full((3,), 9), n, cfg, generator=torch.Generator().manual_seed(0),
+                    stop_id=stop)
+    assert whole.tokens[0].tolist() == script and whole.canvas_passes == 16 and whole.row_passes.tolist() == [16] * 3
+    assert torch.equal(short.tokens[:, :6], whole.tokens[:, :6])      # identical up to and including the <eos>
+    assert bool((short.tokens[:, 6:] == stop).all())                  # the rest is filled with it
+    cumulative = torch.tensor(short.revealed).cumsum(0) // 3          # positions revealed per row after each pass
+    assert short.canvas_passes == int((cumulative < 6).sum()) + 1 < 16  # stopped at the pass that revealed it
+    assert short.sequential_depth == short.canvas_passes + 1 and short.row_passes.tolist() == [short.canvas_passes] * 3
+    for mask in early.masks:                                          # always a suffix of masked positions
+        assert bool((mask.long()[:, 1:] >= mask.long()[:, :-1]).all())
+    confident = realize(ScriptedRealizer(script), None, torch.full((3,), 9), n,
+                        SamplerConfig(num_steps=16, schedule="cosine", order="confidence"), stop_id=stop)
+    assert confident.canvas_passes == 16                              # the stop applies to left_to_right only
+    with pytest.raises(ValueError, match="order"):
+        SamplerConfig(order="right_to_left")
+
+
+def test_realizer_samples_reports_the_depth_rows_needed():
+    script = [10, 11, 1] + [20] * 9
+    realizer = ScriptedRealizer(script)
+
+    class Cache:
+        def expand(self, rows):
+            return self
+
+    realizer.prefill = lambda *args: Cache()                          # type: ignore[attr-defined]
+    task, _ = _tasks()
+    texts, info = realizer_samples(realizer, CharTokenizer(), [task], "humaneval",
+                                   SamplerConfig(num_steps=12, schedule="cosine", order="left_to_right"),
+                                   canvas_len=12, num_samples=4, batch_size=4, seed=0, device=torch.device("cpu"))
+    assert texts == [[CharTokenizer().decode([10, 11])] * 4]
+    # One token per pass at K = 12, N = 12; the <eos> at position 3 is revealed by the third pass, then the stop.
+    assert info["mean_sequential_depth"] == info["sequential_depth"] == 4
+    assert info["mean_revealed_per_step"] == [1.0, 1.0, 1.0] + [0.0] * 9
 
 
 # =============================================================================================

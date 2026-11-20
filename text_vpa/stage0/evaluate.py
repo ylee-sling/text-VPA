@@ -38,7 +38,7 @@ from text_vpa.stage0.autoregressive import cut_at_eos, generate_autoregressive
 from text_vpa.stage0.backbone import RealizerSpec, Stage0Realizer, left_pad, load_gemma4
 from text_vpa.stage0.data import HFTokenizer, Stage0Tokenizer, mbpp_prompt
 from text_vpa.stage0.postprocess import build_sample, is_complete, parses
-from text_vpa.stage0.sampler import SamplerConfig, realize
+from text_vpa.stage0.sampler import ORDERS, SamplerConfig, realize
 from text_vpa.utils.device import resolve_device
 
 __all__ = ["load_tasks", "prompt_text", "realizer_samples", "score", "write_results"]
@@ -74,7 +74,8 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
     """``num_samples`` canvases per task, decoded up to their first <eos>."""
     texts: list[list[str]] = []
     forbidden = [tokenizer.pad_id, tokenizer.bos_id]
-    seconds, tokens_out, depth = 0.0, 0, 0
+    stop_id = tokenizer.eos_id if cfg.order == "left_to_right" else None
+    seconds, tokens_out, depth, row_passes = 0.0, 0, 0, 0
     revealed = [0] * cfg.num_steps
     for index, task in enumerate(tasks):
         ids = [tokenizer.bos_id, *tokenizer.encode_batch([prompt_text(task, benchmark)])[0]]
@@ -86,9 +87,12 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
             while len(rows) < num_samples:
                 n = min(batch_size, num_samples - len(rows))
                 anchor = torch.full((n,), ids[-1], dtype=torch.long, device=device)
-                result = realize(realizer, cache.expand(n), anchor, canvas_len, cfg, forbidden, generator)
-                depth = result.sequential_depth
-                revealed = [a + b for a, b in zip(revealed, result.revealed, strict=True)]
+                result = realize(realizer, cache.expand(n), anchor, canvas_len, cfg, forbidden, generator,
+                                 stop_id=stop_id)
+                depth = max(depth, result.sequential_depth)
+                row_passes += int(result.row_passes.sum())
+                for step, count in enumerate(result.revealed):
+                    revealed[step] += count
                 for row in result.tokens.tolist():
                     kept = cut_at_eos(row, [tokenizer.eos_id])
                     tokens_out += len(kept)
@@ -101,6 +105,7 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
             print(f"  generated {index + 1}/{len(tasks)} problems", file=sys.stderr, flush=True)
     total = max(len(tasks) * num_samples, 1)
     info = {"decoder": "realizer", **cfg.to_dict(), "canvas_len": canvas_len, "sequential_depth": depth,
+            "mean_sequential_depth": round(1 + row_passes / total, 2),
             "generation_seconds": round(seconds, 3), "mean_tokens": round(tokens_out / total, 2),
             "mean_revealed_per_step": [round(r / total, 2) for r in revealed]}
     return texts, info
@@ -214,7 +219,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--mbpp-split", choices=sorted(MBPP_SPLITS), default="test")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--k-steps", type=int, nargs="+", default=[2, 4, 8], help="realizer steps K")
-    p.add_argument("--orders", nargs="+", choices=("random", "confidence"), default=["random"])
+    p.add_argument("--orders", nargs="+", choices=ORDERS, default=["random"],
+                   help="random: the exact jump kernel (H2); confidence; left_to_right (diagnostic)")
     p.add_argument("--schedule", default=None, help="kappa schedule (default: the checkpoint's)")
     p.add_argument("--canvas-len", type=int, default=None, help="N (default: the checkpoint's; ar: 256)")
     p.add_argument("--num-samples", type=int, default=10)
