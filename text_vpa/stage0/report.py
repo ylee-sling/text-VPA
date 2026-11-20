@@ -22,6 +22,16 @@ The learning curve (the trainer's Pass@1 probe on MBPP's validation split) is re
 because a failure of a realizer that was still improving when training stopped is a statement about the
 training budget, not about the method.
 
+The one-token-per-step gate (direction A, rule fixed on 20 Nov 2026 before its run; diagnostics on MBPP's
+validation split, ``stage0_sweep.sh``): wherever both configurations were evaluated,
+
+    rho_1 = Pass@1(trained realizer, left_to_right, K = 256) / Pass@1(code check: the same path, adapters off)
+
+with the same paired bootstrap. passes: rho_1 >= 0.8; fails: rho_1 <= 0.5; partial otherwise; "clearly" when
+the interval lies on the same side of the threshold. It asks whether the adapted realizer, decoding one token
+per step, writes programs about as well as its own backbone; the parallel rows (K <= 128) are read after it.
+Outside the protocol the report also gives rho of the H2 pair for reference, without a verdict.
+
 Reads ``EVAL/<benchmark>/<tag>/{summary.json, samples.jsonl}``; writes ``report.md`` and ``report.json``.
 """
 
@@ -29,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -37,11 +48,13 @@ import numpy as np
 
 from text_vpa.stage0.analyze import tag_order
 
-__all__ = ["bootstrap_ratio", "h2_verdict", "learning_curve", "per_task_rates"]
+__all__ = ["bootstrap_ratio", "gate_verdict", "h2_verdict", "learning_curve", "paired_ratio", "per_task_rates"]
 
 THRESHOLD = 0.5
 PRIMARY = "realizer-K8"
 BASELINE = "ar"
+GATE = ("realizer-K256-left_to_right", "realizer-K256-left_to_right-causal-no_adapters")
+GATE_PASS, GATE_FAIL = 0.8, 0.5
 
 
 def per_task_rates(samples_path: Path) -> dict[str, float]:
@@ -85,6 +98,27 @@ def h2_verdict(ratios: dict[str, tuple[float, float, float]]) -> str:
     return "mixed"
 
 
+def gate_verdict(rho: float, low: float, high: float) -> str:
+    """The one-token-per-step gate of the module docstring."""
+    if math.isnan(rho):
+        return "undecided (the code check solves nothing)"
+    if rho >= GATE_PASS:
+        return ("clearly " if low >= GATE_PASS else "") + "passes"
+    if rho <= GATE_FAIL:
+        return ("clearly " if high <= GATE_FAIL else "") + "fails"
+    return "partial"
+
+
+def paired_ratio(bench_dir: Path, numerator: str, denominator: str) -> tuple[float, float, float]:
+    """``bootstrap_ratio`` of two configurations of one benchmark, paired over their problems."""
+    a = per_task_rates(bench_dir / numerator / "samples.jsonl")
+    b = per_task_rates(bench_dir / denominator / "samples.jsonl")
+    if set(a) != set(b):
+        raise SystemExit(f"{bench_dir.name}: {numerator} and {denominator} were scored on different problems")
+    tasks = sorted(a)
+    return bootstrap_ratio(np.array([a[t] for t in tasks]), np.array([b[t] for t in tasks]))
+
+
 def learning_curve(run_dir: Path) -> list[tuple[int, float]]:
     """(step, probe Pass@1) from the trainer's metrics."""
     path = run_dir / "metrics.jsonl"
@@ -125,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
     table: list[dict[str, Any]] = []
     ratios: dict[str, tuple[float, float, float]] = {}
+    gates: dict[str, tuple[float, float, float]] = {}
     for bench_dir in sorted(d for d in args.eval.iterdir() if d.is_dir()):
         summaries = {}
         for tag_dir in sorted((d for d in bench_dir.iterdir() if (d / "summary.json").exists()),
@@ -137,12 +172,9 @@ def main(argv: list[str] | None = None) -> int:
                           "mean_tokens": s.get("mean_tokens"), "problems": s.get("problems"),
                           "samples": s.get("samples_per_problem")})
         if PRIMARY in summaries and BASELINE in summaries:
-            a = per_task_rates(bench_dir / PRIMARY / "samples.jsonl")
-            b = per_task_rates(bench_dir / BASELINE / "samples.jsonl")
-            if set(a) != set(b):
-                raise SystemExit(f"{bench_dir.name}: the two decoders were scored on different problems")
-            tasks = sorted(a)
-            ratios[bench_dir.name] = bootstrap_ratio(np.array([a[t] for t in tasks]), np.array([b[t] for t in tasks]))
+            ratios[bench_dir.name] = paired_ratio(bench_dir, PRIMARY, BASELINE)
+        if all(tag in summaries for tag in GATE):
+            gates[bench_dir.name] = paired_ratio(bench_dir, *GATE)
 
     verdict = "not evaluated (diagnostic outside the protocol)" if args.no_verdict else h2_verdict(ratios)
     curve = learning_curve(args.run) if args.run else []
@@ -156,8 +188,18 @@ def main(argv: list[str] | None = None) -> int:
     for row in table:
         lines.append(f"| {row['benchmark']} | {row['tag']} | {pct(row['pass@1'])} | {pct(row['pass@10'])} | "
                      f"{pct(row['parse_rate'])} | {row['depth']} | {row['mean_tokens']} |")
+    if gates:
+        lines += ["", "## One token per step (gate of direction A)", "",
+                  f"Ratio of Pass@1, `{GATE[0]}` over `{GATE[1]}`; passes at >= {GATE_PASS}, fails at <= "
+                  f"{GATE_FAIL}; 95% paired bootstrap over problems.", ""]
+        for bench, (rho, low, high) in gates.items():
+            lines.append(f"- {bench}: rho_1 = {rho:.3f} [{low:.3f}, {high:.3f}]: {gate_verdict(rho, low, high)}")
     if args.no_verdict:
         lines[0] = "# Text-VPA Stage 0, diagnostic outside the protocol (no H2 verdict)"
+        if ratios:
+            lines += ["", f"## `{PRIMARY}` over `{BASELINE}` (H2's pair, for reference: no verdict here)", ""]
+            for bench, (rho, low, high) in ratios.items():
+                lines.append(f"- {bench}: rho = {rho:.3f} [{low:.3f}, {high:.3f}]")
     else:
         lines += ["", f"## H2: {verdict}", "",
                   f"Ratio of Pass@1, `{PRIMARY}` over `{BASELINE}`; threshold {THRESHOLD}; 95% paired bootstrap over "
@@ -175,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     (out / "report.json").write_text(json.dumps({
         "verdict": verdict, "threshold": THRESHOLD, "primary": PRIMARY, "baseline": BASELINE,
         "ratios": {b: {"rho": r[0], "low": r[1], "high": r[2]} for b, r in ratios.items()},
+        "gate": {b: {"rho": r[0], "low": r[1], "high": r[2], "verdict": gate_verdict(*r)} for b, r in gates.items()},
         "table": table, "learning_curve": curve, "curve_note": curve_note(curve) if curve else None}, indent=2))
     print(text)
     return 0

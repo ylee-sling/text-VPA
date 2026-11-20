@@ -568,7 +568,10 @@ def test_example_formats():
     prompt, body = s0data.complete_example(ROW)
     assert prompt == ROW["context"] and prompt + body == ROW["target"]
     prompt, code = s0data.write_example(ROW)
-    assert prompt == '"""\nReturn the area of a circle.\n\nUses pi.\nassert area(r, scale) == ...\n"""\n\n'
+    # The assert names the function and nothing else: with the parameter names in it (the first run), the
+    # realizer learned to copy an MBPP assert's literal arguments into its def line.
+    assert prompt == '"""\nReturn the area of a circle.\n\nUses pi.\nassert area(...) == ...\n"""\n\n'
+    assert "scale" not in prompt and "(r" not in prompt
     assert code == ("import math as m\n\n\ndef area(r: float, *, scale=1) -> float:\n    # comment\n"
                     "    return m.pi * r ** 2 * scale\n")
     compile(code, "<write>", "exec")
@@ -623,6 +626,87 @@ def test_tokenize_collate_and_training_state():
     expected = (1.0 - schedule.kappa(drawn.t)).mean()
     observed = drawn.is_mask[:, 1:].float().mean()
     assert abs(float(observed - expected)) < 5 * 0.5 / math.sqrt(512 * 20)
+
+
+def test_prefix_states_reveal_a_prefix_and_mask_the_rest():
+    tok = CharTokenizer()
+    pairs = [("def f(x):\n", "    return x\n", "complete"), ("def g(y):\n", "    y += 1\n    return y * 2\n", "complete")]
+    examples, _ = s0data.tokenize_examples(pairs, tok, canvas_len=40, max_prompt_tokens=16)
+    batch = s0data.collate(examples, 40, tok.eos_id)
+    lengths = batch.length.tolist()
+    assert lengths == [14, 29]
+    schedule = KappaSchedule("cosine")
+
+    # Pinned L: positions < L are clean, positions >= L are [MASK]; weights 1 on the program and its first
+    # <eos>, pad_weight on the filling, 0 on the revealed prefix; next_only keeps position L alone.
+    pinned = torch.tensor([0, 28])
+    state = s0data.prefix_state(batch, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(0), pinned)
+    assert state.canvas_ids.shape == (2, 41) and state.canvas_ids[:, 0].tolist() == batch.anchor.tolist()
+    for row, (first, length) in enumerate(zip(pinned.tolist(), lengths, strict=True)):
+        for j in range(40):
+            assert bool(state.is_mask[row, j + 1]) == (j >= first)
+            want = 0.0 if j < first else (1.0 if j < length else 0.1)
+            assert math.isclose(float(state.weights[row, j]), want, rel_tol=1e-6)
+            if j < first:
+                assert int(state.canvas_ids[row, j + 1]) == int(batch.target[row, j])
+    assert not bool(state.is_mask[:, 0].any())
+    only = s0data.prefix_state(batch, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(0), pinned,
+                               next_only=True)
+    assert torch.equal(only.is_mask, state.is_mask) and only.weights.sum(dim=1).tolist() == [1.0, 1.0]
+    assert only.weights[0, 0] == 1.0 and only.weights[1, 28] == 1.0
+    for bad in (torch.tensor([14, 0]), torch.tensor([0, -1])):               # the first <eos> is never revealed
+        with pytest.raises(ValueError):
+            s0data.prefix_state(batch, schedule, [8], MASK, 0.1, None, bad)
+
+    # Time input: K from the budgets, t the point of K's grid whose kappa is nearest L / N, h = 1 / K
+    # (reference: an explicit loop in float64).
+    big = s0data.collate([examples[1]] * 600, 40, tok.eos_id)
+    drawn = s0data.prefix_state(big, schedule, [2, 4, 8], MASK, 0.1, torch.Generator().manual_seed(5))
+    first = drawn.is_mask[:, 1:].long().argmax(dim=1)
+    assert bool((drawn.is_mask[:, 1:] == (torch.arange(40)[None] >= first[:, None])).all())
+    budgets = (1.0 / drawn.h).round().long()
+    assert set(budgets.tolist()) == {2, 4, 8}
+    for row in range(0, 600, 7):
+        big_k, fraction = int(budgets[row]), int(first[row]) / 40
+        gaps = [abs(1.0 - math.cos(math.pi * (k / big_k) / 2.0) - fraction) for k in range(big_k)]
+        assert math.isclose(float(drawn.t[row]), gaps.index(min(gaps)) / big_k, abs_tol=1e-6)
+    # L is uniform on 0 .. length - 1 = 0 .. 28: every value occurs, the mean is 14 (5 standard errors).
+    assert sorted(set(first.tolist())) == list(range(29))
+    assert abs(float(first.float().mean()) - 14.0) < 5 * math.sqrt((29**2 - 1) / 12 / 600)
+
+
+def test_prefix_fraction_mixes_the_two_state_families():
+    tok = CharTokenizer()
+    examples, _ = s0data.tokenize_examples([("def g(y):\n", "    y += 1\n    return y * 2\n", "complete")], tok, 40, 16)
+    big = s0data.collate([examples[0]] * 512, 40, tok.eos_id)
+    schedule = KappaSchedule("cosine")
+
+    def draw(**kw):
+        return s0data.training_state(big, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(11), **kw)
+
+    base = draw()
+    zero = draw(prefix_fraction=0.0)
+    for name in ("canvas_ids", "is_mask", "t", "h", "weights"):             # 0 is the first run's recipe, exactly
+        assert torch.equal(getattr(zero, name), getattr(base, name)), name
+    mixed = draw(prefix_fraction=0.5)
+    masks = mixed.is_mask[:, 1:]
+    changed = (masks != base.is_mask[:, 1:]).any(dim=1) | (mixed.t != base.t) | (mixed.h != base.h)
+    # A replaced row is prefix-shaped (its mask never switches off along the canvas) and masks its first <eos>;
+    # an untouched row is the uniform state it would have been without the mixture.
+    assert bool((masks[changed][:, 1:] >= masks[changed][:, :-1]).all()) and bool(masks[changed][:, 28].all())
+    assert torch.equal(mixed.canvas_ids[~changed], base.canvas_ids[~changed])
+    share = float(changed.float().mean())                # a few replaced rows coincide with their uniform state
+    assert 0.5 - 5 * math.sqrt(0.25 / 512) - 0.03 < share < 0.5 + 5 * math.sqrt(0.25 / 512)
+    want = torch.where(torch.arange(40)[None] < 29, 1.0, 0.1) * masks
+    torch.testing.assert_close(mixed.weights, want.float())
+    everything = draw(prefix_fraction=1.0).is_mask[:, 1:]
+    assert bool((everything[:, 1:] >= everything[:, :-1]).all()) and bool(everything[:, 28].all())
+    with pytest.raises(ValueError):
+        draw(prefix_fraction=1.5)
+    # Pinned states (validation, the memory check) never mix.
+    pinned = s0data.training_state(big, schedule, [2, 4, 8], MASK, VOCAB, 0.1, torch.Generator().manual_seed(11),
+                                   budget=8, step_index=4, prefix_fraction=1.0)
+    assert set(pinned.t.tolist()) == {0.5} and not bool((pinned.is_mask[:, 2:] >= pinned.is_mask[:, 1:-1]).all())
 
 
 def _write_corpus(root, functions: int = 60, shards: int = 3) -> None:
@@ -815,6 +899,44 @@ def test_training_reduces_the_loss_and_resumes_exactly(tmp_path):
         torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7, msg=name)
 
 
+def test_next_token_metric_is_the_backbones_own_loss_and_prefix_training_lowers_the_realizers(tmp_path):
+    _write_corpus(tmp_path / "corpus", functions=16, shards=2)
+    trainer = _trainer(tmp_path, "p", steps=40, prefix_fraction=0.5)
+    before = trainer.validate()
+    assert {"val_loss_prefix", "val_loss_next", "val_loss_next_backbone", "val_accuracy_next"} <= set(before)
+
+    # Reference: transformers' Gemma 4 on <bos> prompt + program[:L], scored on program[L], for the L of each
+    # held-out function (the trainer's fixed draws, repeated here with the same seed).
+    reference = tiny_backbone()                                        # the same weights as the trainer's backbone
+    cfg, tok = trainer.cfg, trainer.tokenizer
+    generator = torch.Generator().manual_seed(2_000)
+    total = 0.0
+    for start in range(0, len(trainer.validation), cfg.micro_batch):
+        chunk = trainer.validation[start:start + cfg.micro_batch]
+        batch = s0data.collate(chunk, cfg.canvas_len, tok.eos_id)
+        state = s0data.prefix_state(batch, trainer.schedule, [8], MASK, cfg.pad_weight, generator, next_only=True)
+        for row, example in enumerate(chunk):
+            first = int(state.weights[row].argmax())
+            assert 0 <= first < len(example.canvas_ids)
+            ids = torch.tensor([example.prompt_ids + example.canvas_ids[:first]])
+            with torch.no_grad():
+                logits = reference(input_ids=ids).logits[0, -1].double()
+            total += float(-torch.log_softmax(logits, dim=-1)[example.canvas_ids[first]])
+    assert math.isclose(before["val_loss_next_backbone"], total / len(trainer.validation), rel_tol=1e-4)
+
+    trainer.realizer.train()
+    for _ in range(40):
+        last = trainer.train_step()
+    after = trainer.validate()
+    assert math.isfinite(last["loss"])
+    assert after["val_loss_next_backbone"] == before["val_loss_next_backbone"]      # frozen: computed once
+    # One token per step is learned from prefix states: the realizer's next-token loss falls well below the
+    # (random) backbone's and below its own before training.
+    assert after["val_loss_next"] < before["val_loss_next"] - 0.3
+    assert after["val_loss_next"] < after["val_loss_next_backbone"] - 0.3
+    assert after["val_loss_prefix"] < before["val_loss_prefix"] - 0.3
+
+
 def test_memory_fallback_switches_on_checkpointing_then_halves_the_micro_batch(tmp_path, monkeypatch):
     _write_corpus(tmp_path / "corpus", functions=16, shards=2)
     trainer = _trainer(tmp_path, "m", steps=1)
@@ -892,6 +1014,103 @@ def test_failure_outcomes_and_messages():
     assert summary["samples"] == 8 and math.isclose(sum(summary[k] for k in OUTCOMES), 1.0)
     assert summary["syntax"] == 3 / 8 and summary["passed"] == summary["wrong"] == 1 / 8
     assert summary["top_syntax_errors"][0][1] == 1 and len(summary["top_syntax_errors"]) == 3
+
+
+def test_def_line_check_finds_copied_test_arguments(tmp_path):
+    from text_vpa.stage0 import analyze
+
+    tests = {"MBPP/512": "assert count_element_freq((5, 6, (5, 6), 7, (8, 9), 9) ) == {5: 2, 6: 2, 7: 1, 8: 1, 9: 2}",
+             "MBPP/513": "assert add_str((5, 6, 7, 4, 9) , \"FDF\") == [5, 'FDF', 6, 'FDF']",
+             "MBPP/511": "assert find_Min_Sum(12) == 7", "MBPP/367": "assert is_tree_balanced(root) == False",
+             "MBPP/11": "assert remove_Occ(\"hello\",\"l\") == \"heo\""}
+    assert analyze.first_def("import re\n\ndef f(a):  # note\n    pass\ndef g(): pass\n") == "def f(a):"
+    assert analyze.first_def("x = 1\n    def nested(): pass\n") is None
+    assert analyze.assert_arguments(tests["MBPP/513"], "add_str") == '(5,6,7,4,9),"FDF"'
+    assert analyze.assert_arguments(tests["MBPP/513"], "other") is None
+    assert analyze.assert_arguments("assert f( == 3", "f") is None
+
+    def flags(code, task=None):
+        found = analyze.def_line_flags(code, tests.get(task))
+        return {k for k, v in found.items() if v}
+
+    # The first run's samples (MBPP validation and test, 20 Nov 2026).
+    assert flags("def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):\n    pass\n", "MBPP/512") == \
+        {"bad_def", "literal", "copied"}
+    assert flags('def add_str((5, 6, 7, 4, 9) , "FDF"):\n    pass\n', "MBPP/513") == {"bad_def", "literal", "copied"}
+    assert flags("def find_Min_Sum(1):\n    return 1\n", "MBPP/511") == {"bad_def", "literal"}
+    assert flags("def add_str((5,6,7):\n    pass\n", "MBPP/513") == {"bad_def", "literal"}    # a garbled copy
+    assert flags("def l,Occ):\n    pass\n", "MBPP/11") == {"bad_def"}
+    assert flags('def remove_Occ(hello="):\n    pass\n', "MBPP/11") == {"bad_def", "literal"}
+    # The baseline's only "copies": the assert's argument is itself a name. Valid, and no literal.
+    assert flags("def is_tree_balanced(root):\n    return False\n", "MBPP/367") == {"copied"}
+    assert flags("def remove_Occ(s, ch):\n    return s\n", "MBPP/11") == set()
+    assert flags("def f(x=0, y: str = 'a') -> int:\n    return x\n") == {"literal"}   # default values count
+    assert flags("x = 1\n") == {"no_def"}
+    assert flags("def f(a,\n      b):\n    return a\n") == set()                    # continued: no flag
+    assert flags("def copied(1):\n    pass\n") == {"bad_def", "literal"}              # no test: never 'copied'
+
+    rows = [{"task_id": "MBPP/512", "completion": "def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):\n    pass\n"},
+            {"task_id": "MBPP/511", "completion": "def find_Min_Sum(n):\n    return n\n"},
+            {"task_id": "MBPP/511", "completion": "def find_Min_Sum(1):\n    return n\n"},
+            {"task_id": "MBPP/11", "completion": "print(1)\n"}]
+    summary = analyze.def_line_summary(rows, tests)
+    assert (summary["samples"], summary["no_def"], summary["bad_def"], summary["literal"], summary["copied"]) == \
+        (4, 0.25, 0.5, 0.5, 0.25)
+    assert summary["examples"] == ["MBPP/512: def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):",
+                                   "MBPP/511: def find_Min_Sum(1):"]
+    assert analyze.def_line_summary(rows)["copied"] is None
+
+    # The command line: MBPP gets the table, with the copied column only when the asserts are given.
+    mbpp = tmp_path / "mbpp.jsonl"
+    with open(mbpp, "w", encoding="utf-8") as handle:
+        for task, test in tests.items():
+            handle.write(json.dumps({"task_id": int(task.split("/")[1]), "test_list": [test, "assert True"]}) + "\n")
+    assert analyze.load_mbpp_tests(mbpp) == tests
+    for bench in ("mbpp", "humaneval"):
+        (tmp_path / "eval" / bench / "realizer-K8").mkdir(parents=True)
+        with open(tmp_path / "eval" / bench / "realizer-K8" / "samples.jsonl", "w", encoding="utf-8") as handle:
+            handle.writelines(json.dumps({**_sample(raw=r["completion"]), "task_id": r["task_id"]}) + "\n" for r in rows)
+    assert analyze.main(["--eval", str(tmp_path / "eval"), "--mbpp", str(mbpp)]) == 0
+    result = json.loads((tmp_path / "eval" / "analysis.json").read_text())
+    assert result["mbpp"]["realizer-K8"]["def_line"]["copied"] == 0.25
+    assert "def_line" not in result["humaneval"]["realizer-K8"]              # its samples are function bodies
+    text = (tmp_path / "eval" / "analysis.md").read_text()
+    assert "| realizer-K8 | 4 | 25.0% | 50.0% | 50.0% | 25.0% |" in text and text.count("first `def` line") == 1
+    assert analyze.main(["--eval", str(tmp_path / "eval")]) == 0
+    assert "| realizer-K8 | 4 | 25.0% | 50.0% | 50.0% | - |" in (tmp_path / "eval" / "analysis.md").read_text()
+
+
+def test_one_token_per_step_gate(tmp_path):
+    from text_vpa.stage0 import report
+    from text_vpa.stage0.report import GATE, gate_verdict
+
+    assert gate_verdict(0.9, 0.82, 1.0) == "clearly passes" and gate_verdict(0.8, 0.6, 1.0) == "passes"
+    assert gate_verdict(0.36, 0.2, 0.49) == "clearly fails" and gate_verdict(0.5, 0.3, 0.7) == "fails"
+    assert gate_verdict(0.6, 0.45, 0.9) == "partial" and gate_verdict(float("nan"), 0.0, 0.0).startswith("undecided")
+
+    # 10 problems, 5 samples each: the code check solves 4 problems outright, the realizer 3 of the same.
+    def write(tag: str, solved: int) -> None:
+        folder = tmp_path / "mbpp" / tag
+        folder.mkdir(parents=True)
+        with open(folder / "samples.jsonl", "w", encoding="utf-8") as handle:
+            for task in range(10):
+                for j in range(5):
+                    handle.write(json.dumps({"task_id": f"MBPP/{task}", "sample": j, "passed": task < solved}) + "\n")
+        (folder / "summary.json").write_text(json.dumps({"pass@1": solved / 10, "problems": 10,
+                                                         "samples_per_problem": 5}))
+
+    write(GATE[1], 4)
+    write(GATE[0], 3)
+    write("ar", 4)
+    write("realizer-K8", 1)
+    assert report.main(["--eval", str(tmp_path), "--no-verdict"]) == 0
+    result = json.loads((tmp_path / "report.json").read_text())
+    gate = result["gate"]["mbpp"]
+    assert math.isclose(gate["rho"], 0.75) and gate["verdict"] == "partial" and gate["low"] <= 0.75 <= gate["high"]
+    text = (tmp_path / "report.md").read_text()
+    assert "## One token per step (gate of direction A)" in text and "rho_1 = 0.750" in text
+    assert "## H2:" not in text and "for reference: no verdict here" in text and "rho = 0.250" in text
+    assert result["verdict"].startswith("not evaluated")
 
 
 def test_analysis_cli_orders_configurations(tmp_path):

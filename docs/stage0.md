@@ -97,9 +97,13 @@ Each line: the choice, the reason, and the alternative that was not taken.
 13. **Data mix.** Every corpus row gives a `complete` example; a documented top-level function gives a `write`
     example instead with probability 0.5 (about 11% of all examples: 71% of the corpus are methods, which have no
     description-only form; a higher probability would take the most HumanEval-like functions away from
-    `complete`): description = its docstring plus the line
-    `assert name(parameters) == ...` (MBPP names the function in an assert; the corpus has no tests), canvas =
-    imports + the function without its docstring. Prompts over 512 tokens are dropped.
+    `complete`): description = its docstring plus the line `assert name(...) == ...`, canvas = imports + the
+    function without its docstring. MBPP names the function in an assert and the corpus has no tests, so the line
+    carries the name and nothing else. In the first run it listed the parameter names
+    (`assert name(a, b) == ...`), and the realizer learned to copy an assert's arguments into its `def` line
+    ("A flaw in the first run's training data" below). Alternatives not taken: literal arguments made up from
+    annotations and defaults (nothing says what values a function accepts), asserts taken from doctests (few
+    docstrings have them). Prompts over 512 tokens are dropped.
 14. **Sampler.** Primary, and the one H2 is decided on: the exact jump kernel on the mask source, i.e. each masked
     position is revealed with probability pi_{t,h}, positions chosen at random. Secondary, reported next to it:
     the same number of positions per step, most confident first (MaskGIT). A third order for diagnostics only,
@@ -125,6 +129,26 @@ Each line: the choice, the reason, and the alternative that was not taken.
 20. **Memory.** Before the first step a worst-case micro-batch is run; if it does not fit, activation
     checkpointing is switched on, then the micro-batch is halved and the accumulation doubled. The result is in
     `RUN/memory.json`.
+21. **Prefix-shaped states (second run, `prefix_fraction` = 0.5; 0 in the first run).** Half of the training
+    states are drawn differently: the first masked position L is uniform over the program's positions and its
+    first `<eos>`, everything before L is clean and everything from L on is [MASK]. The loss is unchanged
+    (masked-token cross-entropy on every masked position, weight 0.1 on the `<eos>` filling). Time input: K from
+    {2, 4, 8}, t the point of K's grid whose kappa_t is nearest L / N, h = 1/K, i.e. the pair the sampler feeds
+    when that fraction of the canvas is revealed. Reason: these are the states `left_to_right` decodes from, and
+    uniformly random masks practically never produce them (at kappa_t = 0.8, 20 clean tokens in a row have
+    probability about 1%), so the first run was never trained on the prediction that sequential decoding asks
+    for. Half and half gives the exact kernel's states and the sequential ones the same share. Alternatives not
+    taken: a loss on the next token only (it trains one token per step and nothing of what K <= 128 needs),
+    extra weight near L (one more hyperparameter; to be considered if the gate is missed), block-causal
+    attention (direction B, which changes the claim about depth).
+22. **The one-token-per-step gate (fixed on 20 Nov 2026, before the second run).** On MBPP's validation split,
+    5 samples: rho_1 = Pass@1(trained realizer, `left_to_right`, K = N = 256) / Pass@1(code check). Passes at
+    rho_1 >= 0.8, fails at rho_1 <= 0.5, partial in between; "clearly" when the 95% paired-bootstrap interval
+    lies on the same side. At one token per step nothing is decided in parallel, so the ratio is the cost of the
+    adaptation alone. 0.5 is below the estimate for the first run without its data flaw (0.58), so a fail means
+    prefix-shaped states added nothing. It is read with two other numbers: the def-line table (bad and copied
+    `def` lines at the baseline's 0%) and the held-out next-token loss against the backbone's
+    (`val_loss_next`, `val_loss_next_backbone`). Rows at K <= 128 are read after it.
 
 ## Gemma 4 E2B: what was checked on 17 Nov 2026
 
@@ -169,6 +193,11 @@ The probe (MBPP validation, K = 8) stayed between 0.0% and 0.7% from step 5,000 
 was still falling slowly at every state (all-masked 4.26 -> 4.08 nats from step 2,500 to 17,500; mostly revealed
 0.72 -> 0.53). The instruction-tuned row used its chat template and a 768-token budget; it is not part of H2.
 
+**The realizer's MBPP rows are affected by a flaw in this run's training data** (found on 20 Nov, described
+below): 57% of its MBPP samples at K = 8 have a `def` line that is not Python. The verdict does not depend on
+it. HumanEval's prompts contain the signature and no assert, so its rows are untouched, and there the ratio is
+0.051. On MBPP, the samples at K = 8 whose `def` line is valid pass at about 0.5%, a ratio of about 0.02.
+
 ## Diagnostic sweep (20 Nov 2026, `runs/stage0/sweep`)
 
 MBPP validation (90 problems, 5 samples each), the final checkpoint; outside the protocol, no verdict.
@@ -179,6 +208,7 @@ MBPP validation (90 problems, 5 samples each), the final checkpoint; outside the
 | backbone through the realizer's code path (adapters off, causal, one token per step) | 24.7% | 89.8% | 118 |
 | realizer, left to right, K = 256 (one token per step) | 8.9% | 58.7% | 67 |
 | realizer, left to right, K = 256, (t, h) as in training | 8.0% | 59.3% | 65 |
+| realizer, left to right, K = 256, causal canvas masks (adapters on) | 8.7% | 66.2% | 57 |
 | realizer, left to right, K = 128 (one token per step for 42 positions, then 2 to 3) | 7.6% | 44.2% | 51 |
 | realizer, confidence order, K = 128 | 4.9% | 36.2% | 129 |
 | realizer, exact kernel, K = 128 | 0.7% | 20.7% | 129 |
@@ -194,22 +224,99 @@ What it shows:
 
 - **The implementation is verified on the real model.** The realizer's code path with the adapters off reproduces
   the backbone (24.7% against 23.8%, within noise).
-- **The adaptation is the first bottleneck.** Decoding one token per step, the trained realizer keeps about 36% of
-  the backbone's Pass@1 (8.9 / 24.7). Inputs (t, h) taken from training change nothing (8.0%), so the cause is
-  not the step-size input. With this recipe H2 is out of reach at any K, before parallel decisions enter.
-- **Parallel decisions cost a further factor of about 10 at K = 32 and 40 at K = 8**, and the cost depends on the
-  order. The exact jump kernel (random positions) barely improves from K = 32 to K = 128 (0.9% and 0.7%): tokens
+- **At one token per step the trained realizer keeps 36% of the backbone's Pass@1 (8.9 / 24.7), and most of
+  that loss is a flaw in the training data** (next section): 38% of its samples fail at the `def` line. Among the
+  others it keeps about 58%. Inputs (t, h) taken from training change nothing (8.0%), and neither do causal
+  canvas masks at inference (8.7%): what remains is in the trained weights, not in the step-size input and not
+  in what the decoder attends to. (The adapters were trained under bidirectional masks, so the causal run is
+  off their training distribution as well; it rules out a fix at inference and says nothing about what training
+  on prefix-shaped states gives.)
+- **Parallel decisions cost a further factor of about 10 at K = 32 and 40 at K = 8** over all samples (about 30
+  at K = 8 among samples with a valid `def` line), and the cost depends on the order. The exact jump kernel (random positions) barely improves from K = 32 to K = 128 (0.9% and 0.7%): tokens
   committed early far from any known context are guesses that are never revised. Committing contiguous blocks of
   4 or more tokens fails completely (left to right at K = 32 and K = 8), because neighbours decided together
   repeat each other.
 
+### A flaw in the first run's training data (found on 20 Nov 2026)
+
+The first run's `write` examples ended in `assert name(a, b) == ...` with the function's parameter names. In
+training, the parameters of the `def` line were therefore always the arguments of the assert, and the realizer
+learned to copy them. MBPP's asserts hold literal values, so on MBPP the copy is not Python:
+`def count_element_freq((5, 6, (5, 6), 7, (8, 9), 9)):`, `def add_str((5, 6, 7, 4, 9) , "FDF"):`, and at K = 8
+a garbled copy, `def add_str((5,6,7):`.
+
+| MBPP split | decoder | samples | no def | bad def | literal | copied |
+|---|---|---|---|---|---|---|
+| validation | baseline | 450 | 0.0% | 0.0% | 0.0% | 0.0% |
+| validation | code check (adapters off) | 450 | 0.0% | 0.0% | 0.0% | 0.0% |
+| validation | realizer, left to right, K = 256 | 450 | 0.0% | 38.4% | 36.9% | 31.1% |
+| validation | realizer, left to right, K = 128 | 450 | 0.0% | 37.3% | 34.9% | 29.8% |
+| validation | realizer, exact kernel, K = 8 | 450 | 0.2% | 57.3% | 46.4% | 9.6% |
+| test | baseline | 5,000 | 0.1% | 0.0% | 0.1% | 0.2% |
+| test | realizer, exact kernel, K = 8 | 5,000 | 1.4% | 57.1% | 49.2% | 15.2% |
+
+Shares of all samples, from `python -m text_vpa.stage0.analyze --eval RUN/sweep --mbpp data2/eval/mbpp.jsonl`:
+no top-level `def` line; a first `def` line that is not valid Python; a digit or quote in its parameter list;
+a parameter list equal to the arguments of the test's assert. The baseline's 0.2% are tests whose argument is
+itself a name (`is_tree_balanced(root)`).
+
+- **Nearly all syntax errors at one token per step are this flaw.** 41.3% of those samples do not parse and
+  38.4% have a bad `def` line. Among the 61.6% with a valid one, about 95% parse (the backbone: 90%) and about
+  14% pass (8.9 / 0.616), which is 58% of the code check. The model chose which samples those are, so 58% is an
+  estimate of the adaptation's cost without the flaw, not a measurement of it.
+- **MBPP's realizer rows understate the realizer everywhere,** in the first run's table and in this sweep.
+  HumanEval's are not affected (the prompt gives the signature), and H2's verdict stands (see the first run).
+- **Fixed on 20 Nov** in `data.write_example`: the line is `assert name(...) == ...`. The first run's numbers
+  stay in the tables as measured.
+
+## The second run: direction A (prefix-shaped states), decided on 20 Nov 2026
+
+The design is kept (one canvas, constant depth); the training changes in two ways: the data flaw is fixed, and
+half of the training states are prefix-shaped (decision 21). A validation run comes first:
+
+    VALIDATION_ONLY=1 RUN=runs/stage0-a STEPS=10000 TRAIN_SET="prefix_fraction=0.5" bash scripts/ncp/stage0.sh
+
+- **Training:** from the released checkpoint (not from the first run's adapters, which carry the copying),
+  10,000 steps of 32 examples, otherwise the first run's recipe. About 14 h on the L4.
+- **While it trains:** every 2,500 steps the held-out next-token loss in prefix states, `val_loss_next`, next to
+  the frozen backbone's own on the same tokens, `val_loss_next_backbone`. The difference is the cost of the
+  adaptation at one token per step in nats per token, at the price of one validation pass
+  (`bash scripts/ncp/stage0.sh status` prints the curve).
+- **After training,** on MBPP's validation split (90 problems, 5 samples), in this order: the trained realizer at
+  one token per step; the code check; left to right at K = 8, 32, 128; the exact kernel and the confidence order
+  at K = 8, 32, 128; the baseline; and as a control the rows with (t, h) as in training. `RUN/sweep/report.md`
+  carries the gate (decision 22), `analysis.md` the def-line table. About 5 h.
+- **Not touched:** HumanEval and MBPP's test split. No H2 verdict comes out of this run. If the gate passes, the
+  protocol run of the same recipe (25,000 steps, both benchmarks, the rule of decision 17) follows.
+
+How the result is read, fixed before the run:
+
+1. **Def lines.** Bad and copied `def` lines at the baseline's level (0%): the fix worked. Anything else: stop
+   and read samples.
+2. **The gate.** rho_1 >= 0.8: one token per step works, and the question becomes what fewer steps cost.
+   rho_1 <= 0.5: prefix-shaped states added nothing to the fix; the adaptation recipe is the problem (rank,
+   budget, weight near the first masked position). In between: continue the run or reweight.
+3. **K = 8, 32, 128.** This is what direction A is about. Prefix-shaped states teach the realizer the states of
+   sequential decoding. They do not remove the cost of deciding many tokens in one pass from the same context
+   (repeated neighbours, contiguous blocks of 4 or more failing completely in the first run). The report prints
+   H2's ratio on this split for reference (first run: 0.2 / 23.8). If the gate passes and K = 8 stays near
+   zero, the remaining gap is the factorization error the plan is meant to remove (Proposition 1), and Stage 1
+   gets a baseline to be measured against at K = 32 to 128, where this realizer is not at the floor.
+4. **Control.** The one-token-per-step row with (t, h) as in training made no difference in the first run
+   (8.0% against 8.9%). If it differs from the gate's row by more than 4 points here, the network has started to
+   use its time input, both rows are reported, and what the sampler feeds above K = 8 becomes a decision.
+
 ## Reading the result
 
-- `python -m text_vpa.stage0.analyze --eval RUN/eval` sorts every sample into passed, empty, syntax error, wrong
-  answer, runtime error or timeout, lists the most frequent syntax errors, and counts adjacent repeated
-  identifiers (a symptom of positions decided in parallel from the same context).
+- `python -m text_vpa.stage0.analyze --eval RUN/eval --mbpp data2/eval/mbpp.jsonl` sorts every sample into
+  passed, empty, syntax error, wrong answer, runtime error or timeout, lists the most frequent syntax errors,
+  counts adjacent repeated identifiers (a symptom of positions decided in parallel from the same context), and
+  for MBPP checks the first `def` line of every sample (missing, not Python, a literal in the parameter list, a
+  copy of the test's arguments).
 - `bash scripts/ncp/stage0_sweep.sh` (after the run) evaluates on MBPP's validation split, next to the baseline
-  on the same split; outside the protocol, no verdict. It splits the gap to the baseline into three parts:
+  on the same split; outside the protocol, no verdict. `STAGES` chooses and orders its stages; with the code
+  check and the one-token-per-step row both present, `report.md` decides the gate of decision 22. It splits the
+  gap to the baseline into three parts:
   1. **Code check:** the realizer's code path with the adapters off, causal masks and `left_to_right` at
      K = 256 (exactly one token per step) is the backbone's own decoding; it must match the baseline (on the tiny
      Gemma 4 it reproduces greedy `generate` token for token). If it does not, there is a bug and every Stage 0

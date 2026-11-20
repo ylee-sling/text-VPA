@@ -14,6 +14,12 @@
 #   SMOKE=1 bash scripts/ncp/stage0.sh    the whole pipeline in miniature (30 steps, 8 problems, 2 samples) in its
 #                                         own run directory: a check of the server before the long run
 #
+#   VALIDATION_ONLY=1 RUN=runs/stage0-a STEPS=10000 TRAIN_SET="prefix_fraction=0.5" bash scripts/ncp/stage0.sh
+#                                         a validation run of a changed recipe: checks -> training -> the
+#                                         diagnostic sweep on MBPP's validation split (stage0_sweep.sh: the
+#                                         one-token-per-step gate first, then K = 8, 32, 128). It evaluates
+#                                         nothing on HumanEval or on MBPP's test split and gives no H2 verdict.
+#
 # Re-running the same command continues: finished steps are skipped (markers in RUN/done/), training resumes
 # from RUN/last.pt, and every evaluated configuration is skipped once its summary.json exists.
 #
@@ -36,6 +42,12 @@
 #   NUM_SAMPLES  [10]                   samples per problem
 #   ORDERS       [random confidence]    realizer samplers: the exact jump kernel (H2) and the confidence order
 #   TRAIN_SET    []                     extra Stage0Config overrides for a new run, e.g. "lora_rank=32 lr=1e-4"
+#   VALIDATION_ONLY [0]                 1: after training, run the sweep on MBPP validation instead of the
+#                                       protocol's evaluation (no harness check, nothing on the test sets)
+#   SWEEP_STAGES [adaptation code l2r parallel baseline matched]   stages of that sweep, in order
+#                                       (stage0_sweep.sh): the gate's two rows first, the (t, h) control last
+#   SWEEP_SAMPLES [5; smoke: 2]         samples per problem in that sweep
+#   K_STEPS      [8 32 128]             step counts of that sweep's parallel stages
 #   AR_IT        [1]                    also evaluate MODEL_IT through its chat template (after the report)
 #   HF_TOKEN     [unset]                only needed if the Hub asks for it
 #   ALLOW_BUSY_GPU [0]                  1: start although another process holds GPU memory
@@ -57,6 +69,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 SMOKE="${SMOKE:-0}"
 if [[ "$SMOKE" == 1 ]]; then
   RUN="${RUN:-runs/stage0-smoke}"; STEPS="${STEPS:-30}"; NUM_SAMPLES="${NUM_SAMPLES:-2}"; LIMIT="${LIMIT:-8}"
+  SWEEP_SAMPLES="${SWEEP_SAMPLES:-2}"
   SMOKE_SET="save_every=15 eval_every=15 log_every=5 warmup_steps=5 val_examples=32 probe_samples=1"
 else
   RUN="${RUN:-runs/stage0}"; STEPS="${STEPS:-25000}"; NUM_SAMPLES="${NUM_SAMPLES:-10}"; LIMIT="${LIMIT:-}"
@@ -68,6 +81,9 @@ MODEL_IT="${MODEL_IT:-google/gemma-4-E2B-it}"
 CANVAS_LEN="${CANVAS_LEN:-256}"
 ORDERS="${ORDERS:-random confidence}"
 TRAIN_SET="${TRAIN_SET:-}"
+VALIDATION_ONLY="${VALIDATION_ONLY:-0}"
+SWEEP_STAGES="${SWEEP_STAGES:-adaptation code l2r parallel baseline matched}"
+SWEEP_SAMPLES="${SWEEP_SAMPLES:-5}"
 AR_IT="${AR_IT:-1}"
 ALLOW_BUSY_GPU="${ALLOW_BUSY_GPU:-0}"
 SKIP_TESTS="${SKIP_TESTS:-0}"
@@ -99,9 +115,15 @@ probes = {r["step"]: r["eval/probe_pass@1"] for r in rows if "eval/probe_pass@1"
 if probes:
     print("probe (Pass@1 on MBPP validation, K = 8): "
           + ", ".join(f"{s}: {100 * v:.1f}%" for s, v in sorted(probes.items())))
+nexts = {r["step"]: r for r in rows if "eval/val_loss_next" in r}
+if nexts:
+    backbone = next(iter(nexts.values()))["eval/val_loss_next_backbone"]
+    print(f"one token per step, held-out next-token loss in nats (the backbone's own: {backbone:.3f}): "
+          + ", ".join(f"{s}: {r['eval/val_loss_next']:.3f}" for s, r in sorted(nexts.items())))
 EOF
   fi
   if [[ -f "$RUN/eval/report.md" ]]; then echo; cat "$RUN/eval/report.md"; fi
+  if [[ -f "$RUN/sweep/report.md" ]]; then echo; cat "$RUN/sweep/report.md"; fi
   if command -v tmux >/dev/null && tmux has-session -t "=$SESSION" 2>/dev/null; then
     echo "tmux session '$SESSION' is running"
   else
@@ -126,7 +148,8 @@ launch() {
     # own, older environment to the new session.
     local env_args=() name
     for name in SMOKE RUN DATA MODEL MODEL_IT STEPS CANVAS_LEN NUM_SAMPLES LIMIT ORDERS TRAIN_SET AR_IT \
-                ALLOW_BUSY_GPU SKIP_TESTS REQUIRE_GPU PREFLIGHT_ARGS PY HF_TOKEN; do
+                VALIDATION_ONLY SWEEP_STAGES SWEEP_SAMPLES K_STEPS ALLOW_BUSY_GPU SKIP_TESTS REQUIRE_GPU \
+                PREFLIGHT_ARGS PY HF_TOKEN; do
       if [[ -n "${!name:-}" ]]; then env_args+=(-e "$name=${!name}"); fi
     done
     tmux new-session -d -s "$SESSION" -c "$ROOT" "${env_args[@]}" \
@@ -169,7 +192,8 @@ EOF
 run() {
   mkdir -p "$RUN/done"
   trap 'log "Stage 0 stopped with an error (line $LINENO); rerun the same command to continue"' ERR
-  log "Stage 0: RUN=$RUN DATA=$DATA MODEL=$MODEL STEPS=$STEPS N=$CANVAS_LEN samples=$NUM_SAMPLES smoke=$SMOKE"
+  log "Stage 0: RUN=$RUN DATA=$DATA MODEL=$MODEL STEPS=$STEPS N=$CANVAS_LEN samples=$NUM_SAMPLES smoke=$SMOKE" \
+    "validation_only=$VALIDATION_ONLY train_set='$TRAIN_SET'"
   [[ -x "$PY" ]] || die "$PY is missing: this script uses the repository's .venv"
   LIMIT_ARGS=(); [[ -n "$LIMIT" ]] && LIMIT_ARGS=(--limit "$LIMIT")
   read -r -a ORDER_ARGS <<< "$ORDERS"
@@ -241,7 +265,7 @@ EOF
   fi
 
   # ---- 6. harness check: canonical solutions through Stage 0's truncation -----------------------
-  if ! done_marker harness; then
+  if [[ "$VALIDATION_ONLY" != 1 ]] && ! done_marker harness; then
     "$PY" -m text_vpa.stage0.evaluate --decoder reference --eval-dir "$DATA/eval" --out "$RUN/harness" \
       --exec-workers "$EXEC_WORKERS" >/dev/null
     "$PY" - "$RUN/harness" <<'EOF'
@@ -259,7 +283,7 @@ EOF
                --canvas-len "$CANVAS_LEN" --exec-workers "$EXEC_WORKERS" "${LIMIT_ARGS[@]}")
 
   # ---- 7. the autoregressive baseline -----------------------------------------------------------
-  if ! done_marker ar; then
+  if [[ "$VALIDATION_ONLY" != 1 ]] && ! done_marker ar; then
     log "autoregressive baseline: the model's own generate, $NUM_SAMPLES samples per problem"
     "$PY" -m text_vpa.stage0.evaluate --decoder ar "${EVAL_COMMON[@]}"
     mark ar
@@ -277,6 +301,15 @@ EOF
         --set "model=$MODEL_DIR" "canvas_len=$CANVAS_LEN" "steps=$STEPS" $SMOKE_SET $TRAIN_SET
     fi
     mark "train-$STEPS"
+  fi
+
+  # ---- 8v. a validation run ends with the diagnostic sweep on MBPP's validation split -----------
+  if [[ "$VALIDATION_ONLY" == 1 ]]; then
+    log "validation run: the sweep on MBPP validation ($SWEEP_STAGES); the test sets stay untouched"
+    RUN="$RUN" DATA="$DATA" MODEL="$MODEL" PY="$PY" NUM_SAMPLES="$SWEEP_SAMPLES" STAGES="$SWEEP_STAGES" \
+      LIMIT="$LIMIT" K_STEPS="${K_STEPS:-8 32 128}" bash scripts/ncp/stage0_sweep.sh run
+    log "validation run finished: $RUN/sweep/report.md, $RUN/sweep/analysis.md"
+    return 0
   fi
 
   # ---- 9. the realizer at K = 2, 4, 8 -----------------------------------------------------------

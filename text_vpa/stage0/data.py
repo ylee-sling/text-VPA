@@ -18,14 +18,21 @@ autoregressive baseline:
 Training examples come from the repository's corpus (``text_vpa.data.corpus``: {"context", "target", ...} rows,
 ``target`` starting with ``context``). Every row yields a ``complete`` example; a documented top-level function
 yields, with probability ``write_fraction``, a ``write`` example instead: description = its docstring followed by
-the line ``assert name(parameters) == ...`` (MBPP prompts name the function in an assert; the corpus has no
-tests), canvas = imports + the function without its docstring.
+the line ``assert name(...) == ...``, canvas = imports + the function without its docstring. MBPP prompts name
+the function in an assert, and the corpus has no tests, so the line gives the name and nothing else. Until
+20 Nov 2026 it listed the parameter names, ``assert name(a, b) == ...``: the realizer learned to copy the
+assert's arguments into its ``def`` line, and on MBPP, whose asserts hold literal values, 31% of its samples
+at one token per step copied them verbatim (``def add_str((5, 6, 7, 4, 9), "FDF"):``) and 38% had a ``def``
+line that is not Python (the backbone: 0%). ``analyze.py`` measures this.
 
 A canvas is N token positions: the program's tokens, one <eos>, then <eos> up to N. Examples whose program does
 not fit are dropped, never truncated (a cut-off program would teach unterminated code).
 
 Training states (Text-VPA Eq. 11 with the mask source): K is drawn from the trained budgets, t = k/K on the grid
-the sampler evaluates, and each canvas position holds its token with probability kappa_t, else [MASK].
+the sampler evaluates, and each canvas position holds its token with probability kappa_t, else [MASK]. With
+``prefix_fraction`` > 0 that share of the states is prefix-shaped instead (``prefix_state``): the program up to
+a uniformly drawn position is revealed and everything after it is masked, the states ``left_to_right`` decodes
+from, which uniformly random masks practically never produce.
 """
 
 from __future__ import annotations
@@ -59,6 +66,7 @@ __all__ = [
     "complete_example",
     "load_validation",
     "mbpp_prompt",
+    "prefix_state",
     "tokenize_examples",
     "training_state",
     "write_example",
@@ -126,7 +134,8 @@ def write_example(row: dict) -> tuple[str, str] | None:
     """(prompt, canvas text) of the ``write`` format, or None when the row has no usable docstring.
 
     The function is the last top-level definition of ``target`` (imports come first). Methods are skipped
-    (their ``self`` has no caller in a description), as are one-line definitions.
+    (their ``self`` has no caller in a description), as are one-line definitions. The assert line names the
+    function and leaves its arguments out (see the module docstring for what listing them taught).
     """
     if not row.get("documented", True) or row.get("method", False):
         return None
@@ -149,12 +158,7 @@ def write_example(row: dict) -> tuple[str, str] | None:
         return None
     lines = target.splitlines(keepends=True)
     code = "".join(lines[: first.lineno - 1] + lines[first.end_lineno:])
-    args = func.args
-    names = [a.arg for a in args.posonlyargs + args.args]
-    names += ["*" + args.vararg.arg] if args.vararg else []
-    names += [a.arg for a in args.kwonlyargs]
-    names += ["**" + args.kwarg.arg] if args.kwarg else []
-    description = inspect.cleandoc(doc) + f"\nassert {func.name}({', '.join(names)}) == ..."
+    description = inspect.cleandoc(doc) + f"\nassert {func.name}(...) == ..."
     return write_prompt(description), code
 
 
@@ -238,14 +242,29 @@ class TrainingState:
     weights: Tensor                # [B, N] loss weight of each canvas token (0 where it is not masked)
 
 
+def _state(batch: Batch, w_t: Tensor, mask_id: int, pad_weight: float, t: Tensor, h: Tensor) -> TrainingState:
+    """The anchor in front of w_t, and the loss weights of every masked position (see ``training_state``)."""
+    b, n = batch.target.shape
+    masked = w_t == mask_id
+    positions = torch.arange(n)[None, :]
+    weights = torch.where(positions < batch.length[:, None], 1.0, pad_weight) * masked
+    front = torch.zeros(b, 1, dtype=torch.bool)
+    return TrainingState(torch.cat([batch.anchor[:, None], w_t], dim=1), torch.cat([front, masked], dim=1),
+                         t.float(), h.float(), weights.float())
+
+
 def training_state(batch: Batch, schedule: KappaSchedule, step_budgets: Sequence[int], mask_id: int,
                    vocab_size: int, pad_weight: float, generator: torch.Generator | None = None,
-                   budget: int | None = None, step_index: int | None = None) -> TrainingState:
+                   budget: int | None = None, step_index: int | None = None,
+                   prefix_fraction: float = 0.0) -> TrainingState:
     """A state on the mask-source mixture path and its loss weights (on the CPU).
 
     Loss weights: 1 on masked program tokens and on the first <eos>, ``pad_weight`` on the masked <eos> filling
     the canvas after it, 0 on revealed positions (the mask source keeps them clean, so they carry no loss).
     ``budget`` and ``step_index`` pin K and k (evaluation); by default they are drawn (``mixture_path_sample``).
+    ``prefix_fraction``: each drawn state is replaced, with this probability and independently per example, by
+    a ``prefix_state`` (same loss weights). It applies to drawn states only, and at 0 no extra random number is
+    drawn (states are then exactly those of the first Stage 0 run).
     """
     target = batch.target
     b, n = target.shape
@@ -257,16 +276,62 @@ def training_state(batch: Batch, schedule: KappaSchedule, step_budgets: Sequence
         h = torch.full((b,), 1.0 / budget)
         arrived = torch.rand(b, n, generator=generator) < schedule.kappa(t)[:, None]
         w_t = torch.where(arrived, target, torch.full_like(target, mask_id))
-    else:
-        sample = mixture_path_sample(target, schedule, vocab_size, list(step_budgets), source="mask",
-                                     mask_id=mask_id, time_sampling="grid", generator=generator)
-        w_t, t, h = sample.w_t, sample.t, sample.h
-    masked = w_t == mask_id
+        return _state(batch, w_t, mask_id, pad_weight, t, h)
+    sample = mixture_path_sample(target, schedule, vocab_size, list(step_budgets), source="mask",
+                                 mask_id=mask_id, time_sampling="grid", generator=generator)
+    state = _state(batch, sample.w_t, mask_id, pad_weight, sample.t, sample.h)
+    if not 0.0 <= prefix_fraction <= 1.0:
+        raise ValueError("prefix_fraction must lie in [0, 1]")
+    if prefix_fraction == 0.0:
+        return state
+    chosen = torch.rand(b, generator=generator) < prefix_fraction
+    prefix = prefix_state(batch, schedule, step_budgets, mask_id, pad_weight, generator)
+    row = chosen[:, None]
+    return TrainingState(torch.where(row, prefix.canvas_ids, state.canvas_ids),
+                         torch.where(row, prefix.is_mask, state.is_mask), torch.where(chosen, prefix.t, state.t),
+                         torch.where(chosen, prefix.h, state.h), torch.where(row, prefix.weights, state.weights))
+
+
+def prefix_state(batch: Batch, schedule: KappaSchedule, step_budgets: Sequence[int], mask_id: int,
+                 pad_weight: float, generator: torch.Generator | None = None, prefix_len: Tensor | None = None,
+                 next_only: bool = False) -> TrainingState:
+    """A revealed prefix and a masked suffix: the states the ``left_to_right`` order decodes from (on the CPU).
+
+    The first masked position L is drawn uniformly from 0, ..., length - 1, so a program token or the first
+    <eos> is always masked (``prefix_len`` [B] pins L); positions < L hold their tokens, positions >= L are
+    [MASK]. Loss weights as in ``training_state`` on every masked position; with ``next_only``, weight 1 at L
+    alone, the next-token loss of one-token-per-step decoding (a validation metric, not a training state).
+
+    Time input: K is drawn from ``step_budgets`` and t is the point of K's grid k/K (k = 0 .. K-1) whose kappa_t
+    lies nearest the revealed fraction L / N, h = 1/K: the pair the sampler gives the network once that fraction
+    of the canvas is revealed, and always a pair of the grid seen in training.
+    """
+    target = batch.target
+    b, n = target.shape
+    length = batch.length
+    if prefix_len is None:
+        draw = torch.rand(b, generator=generator)
+        prefix_len = torch.minimum((draw * length.double()).long(), length - 1)
+    prefix_len = prefix_len.long()
+    if bool((prefix_len < 0).any()) or bool((prefix_len >= length).any()):
+        raise ValueError("need 0 <= prefix_len < length")
+    budgets = torch.tensor([int(k) for k in step_budgets], dtype=torch.long)
+    if budgets.numel() == 0 or bool((budgets < 1).any()):
+        raise ValueError("step_budgets must be positive")
+    big_k = budgets[torch.randint(len(budgets), (b,), generator=generator)]
+    ks = torch.arange(int(budgets.max()))[None, :].expand(b, -1)
+    gap = (schedule.kappa(ks.double() / big_k[:, None].double()) - (prefix_len.double() / n)[:, None]).abs()
+    gap = torch.where(ks < big_k[:, None], gap, torch.full_like(gap, float("inf")))
+    t = gap.argmin(dim=1).double() / big_k.double()
+    h = 1.0 / big_k.double()
     positions = torch.arange(n)[None, :]
-    weights = torch.where(positions < batch.length[:, None], 1.0, pad_weight) * masked
-    front = torch.zeros(b, 1, dtype=torch.bool)
-    return TrainingState(torch.cat([batch.anchor[:, None], w_t], dim=1), torch.cat([front, masked], dim=1),
-                         t.float(), h.float(), weights.float())
+    masked = positions >= prefix_len[:, None]
+    w_t = torch.where(masked, torch.full_like(target, mask_id), target)
+    state = _state(batch, w_t, mask_id, pad_weight, t, h)
+    if next_only:
+        weights = (positions == prefix_len[:, None]).float()
+        return TrainingState(state.canvas_ids, state.is_mask, state.t, state.h, weights)
+    return state
 
 
 # ---------------------------------------------------------------------------------------------

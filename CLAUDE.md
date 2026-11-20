@@ -33,9 +33,9 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/utils/profiler.py` | Sec. 5.4, App. A.2 | roofline (Table 3), measured latency, simulated AR decoder |
 | `text_vpa/utils/memory_probe.py` | — | peak GPU memory and step time of a config on worst-case batches |
 | `train.py`, `generate.py`, `evaluate.py` | — | CLIs |
-| `text_vpa/stage0/` | Text-VPA Sec. 3, Sec. 6 (Stage 0) | the plan-free Gemma 4 E2B realizer: `backbone.py` (prompt prefill by the frozen backbone, canvas-only LoRA, bidirectional canvas, mask embedding, zero-init (t, h) modulation, AR shift with a clamped anchor), `data.py`, `sampler.py` (exact jump kernel on the mask source), `autoregressive.py` (the baseline: the model's own `generate`), `postprocess.py`, `train.py`, `evaluate.py`, `report.py` (H2 verdict), `analyze.py` (how samples failed), `preflight.py` |
-| `scripts/ncp/stage0.sh` | — | Stage 0 on the NCP L4 server, resumable; never shuts the server down |
-| `scripts/ncp/stage0_sweep.sh` | — | diagnostic after Stage 0, outside the protocol, on MBPP validation: a code check (the backbone's own decoding through the realizer's code path), the adapted realizer one token per step, and three orders (exact kernel, confidence, left to right) at K = 8 to 128 |
+| `text_vpa/stage0/` | Text-VPA Sec. 3, Sec. 6 (Stage 0) | the plan-free Gemma 4 E2B realizer: `backbone.py` (prompt prefill by the frozen backbone, canvas-only LoRA, bidirectional canvas, mask embedding, zero-init (t, h) modulation, AR shift with a clamped anchor), `data.py`, `sampler.py` (exact jump kernel on the mask source), `autoregressive.py` (the baseline: the model's own `generate`), `postprocess.py`, `train.py`, `evaluate.py`, `report.py` (H2 verdict, one-token-per-step gate), `analyze.py` (how samples failed, def-line check), `preflight.py` |
+| `scripts/ncp/stage0.sh` | — | Stage 0 on the NCP L4 server, resumable; never shuts the server down. `VALIDATION_ONLY=1`: train a changed recipe, then the sweep on MBPP validation only (no test set, no H2 verdict) |
+| `scripts/ncp/stage0_sweep.sh` | — | diagnostic after Stage 0, outside the protocol, on MBPP validation: a code check (the backbone's own decoding through the realizer's code path), the adapted realizer one token per step, and three orders (exact kernel, confidence, left to right) at K = 8 to 128; `STAGES` picks and orders the stages; its report decides the one-token-per-step gate |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
 | `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline; `CORPUS=shards` all of github-code-clean, up to 2M functions, or `export`; corpus recipe and run-corpus guards; Pass@k with and without energies), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown, outcome markers per run directory; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
 
@@ -85,6 +85,12 @@ own rules:
    activation checkpointing calls the block again during the backward pass.
 5. **Nothing is selected on a test set.** The probe uses MBPP's validation split; the final checkpoint is the
    one evaluated; H2's decision rule is in `report.py` and `docs/stage0.md` and was fixed before the run.
+   A changed recipe is validated with `VALIDATION_ONLY=1` (MBPP validation, the gate of decision 22) before it
+   gets a protocol run.
+6. **A training prompt never shows what the canvas must contain.** The `write` format's assert names the
+   function only (`assert name(...) == ...`). The first run listed the parameter names there and the realizer
+   learned to copy an assert's arguments into its `def` line (38% invalid `def` lines on MBPP). After any change
+   to a prompt format, run `analyze.py --mbpp` on samples before reading Pass@1.
 
 ## Tests
 

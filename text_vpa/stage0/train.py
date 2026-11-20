@@ -11,7 +11,10 @@ trained budgets, t = k/K and w_t (``data.training_state``),
     L = sum_j m_j omega_j ( -log p_psi(w_1^j | prompt, w_t, t, h) ) / sum_j m_j omega_j,
 
 with m_j = 1 where w_t^j = [MASK], omega_j = 1 on program tokens and the first <eos> and ``pad_weight`` on the
-<eos> filling the rest of the canvas, and p_psi(w^j | .) read from the output at canvas index j - 1.
+<eos> filling the rest of the canvas, and p_psi(w^j | .) read from the output at canvas index j - 1. With
+``prefix_fraction`` > 0 (direction A of the diagnosis, 20 Nov 2026) that share of the states is prefix-shaped
+(``data.prefix_state``: the program revealed up to a uniformly drawn position, everything after it masked), with
+the same loss.
 
 One step = ``grad_accum`` micro-batches of ``micro_batch`` examples. Per micro-batch: the frozen backbone
 prefills the prompts without gradients (the prompt cache does not depend on any trained parameter), then one
@@ -26,6 +29,13 @@ Every ``eval_every`` steps: masked-token loss on held-out corpus functions at fo
 probe -- Pass@1 on MBPP's *validation* split (90 problems, never the test split) at K = 8 -- which is the
 learning curve ``report.py`` uses to say whether training had converged. The final checkpoint is the one
 evaluated; nothing is selected on a test set.
+
+The same evaluation also measures one-token-per-step decoding on the held-out functions, cheaply: in a prefix
+state with a fixed first masked position L per function, ``val_loss_next`` is the realizer's loss on token L
+(what ``left_to_right`` at K = N samples from) and ``val_loss_next_backbone`` the frozen backbone's own
+next-token loss on the same tokens (adapters off, causal canvas: its autoregressive prediction, computed once).
+Their difference, in nats per token, is the cost of the adaptation at one token per step; ``val_loss_prefix`` is
+the loss on every masked position of those states.
 """
 
 from __future__ import annotations
@@ -53,8 +63,10 @@ from text_vpa.stage0.data import (
     Example,
     HFTokenizer,
     Stage0Tokenizer,
+    TrainingState,
     collate,
     load_validation,
+    prefix_state,
     training_state,
 )
 from text_vpa.stage0.evaluate import autocast, load_tasks, realizer_samples, score
@@ -75,6 +87,7 @@ class Stage0Config:
     write_fraction: float = 0.5
     schedule: str = "cosine"
     step_budgets: list[int] = field(default_factory=lambda: [2, 4, 8])
+    prefix_fraction: float = 0.0           # share of prefix-shaped training states (0: the first run's recipe)
     pad_weight: float = 0.1
     lora_rank: int = 64
     lora_alpha: float = 64.0
@@ -130,20 +143,27 @@ class Stage0Trainer:
         self.step = 0
         self.logger = logger or MetricLogger(self.run_dir)
         self.examples_seen = 0
+        self._backbone_next: dict[str, float] | None = None     # the frozen backbone's, computed once
 
     # -- one micro-batch -----------------------------------------------------------------------
     def loss_on(self, batch: Batch, budget: int | None = None, step_index: int | None = None,
-                generator: torch.Generator | None = None) -> tuple[torch.Tensor, dict[str, float]]:
-        """The objective on one batch and its statistics (weighted sums, for pooling)."""
+                generator: torch.Generator | None = None, state: TrainingState | None = None,
+                mode: str = "bidirectional", adapters: bool = True) -> tuple[torch.Tensor, dict[str, float]]:
+        """The objective on one batch and its statistics (weighted sums, for pooling).
+
+        ``state`` replaces the drawn training state (validation); ``mode`` and ``adapters`` as in
+        ``Stage0Realizer.canvas_hidden`` (``causal`` without adapters is the backbone's own prediction).
+        """
         cfg, dev = self.cfg, self.device
-        state = training_state(batch, self.schedule, cfg.step_budgets, self.tokenizer.mask_id,
-                               self.tokenizer.vocab_size, cfg.pad_weight, generator or self.generator, budget,
-                               step_index)
+        if state is None:
+            state = training_state(batch, self.schedule, cfg.step_budgets, self.tokenizer.mask_id,
+                                   self.tokenizer.vocab_size, cfg.pad_weight, generator or self.generator, budget,
+                                   step_index, prefix_fraction=cfg.prefix_fraction)
         with autocast(dev):
             cache = self.realizer.prefill(*left_pad(batch.prefix_rows, self.tokenizer.pad_id, dev))
             hidden = self.realizer.canvas_hidden(
                 cache, state.canvas_ids.to(dev), state.is_mask.to(dev), state.t.to(dev), state.h.to(dev),
-                checkpointing=cfg.grad_checkpoint and torch.is_grad_enabled())
+                mode=mode, adapters=adapters, checkpointing=cfg.grad_checkpoint and torch.is_grad_enabled())
             predicted = hidden[:, : cfg.canvas_len]                  # index j predicts canvas token j + 1
             weights = state.weights.to(dev)
             chosen = weights > 0
@@ -179,7 +199,9 @@ class Stage0Trainer:
     # -- evaluation ----------------------------------------------------------------------------
     @torch.no_grad()
     def validate(self) -> dict[str, float]:
-        """Masked-token loss and accuracy on the held-out functions at k = 0, 2, 4, 6 of K = 8 (fixed draws)."""
+        """Masked-token loss and accuracy on the held-out functions at k = 0, 2, 4, 6 of K = 8 (fixed draws), and
+        on prefix states: every masked position (``prefix``), the next token alone (``next``) and the frozen
+        backbone's next-token loss on the same tokens (``next_backbone``, computed on the first call)."""
         cfg = self.cfg
         self.realizer.eval()
         out: dict[str, float] = {}
@@ -199,8 +221,31 @@ class Stage0Trainer:
                 sums[key] += at_k[key]
         out["val_loss"] = sums["nll_sum"] / max(sums["weight_sum"], 1e-8)
         out["val_accuracy"] = sums["hits"] / max(sums["masked"], 1.0)
+        out.update(self._prefix_metrics("prefix", next_only=False))
+        out.update(self._prefix_metrics("next", next_only=True))
+        if self._backbone_next is None:
+            self._backbone_next = self._prefix_metrics("next_backbone", next_only=True, mode="causal",
+                                                       adapters=False)
+        out.update(self._backbone_next)
         self.realizer.train()
         return out
+
+    def _prefix_metrics(self, name: str, next_only: bool, mode: str = "bidirectional", adapters: bool = True
+                        ) -> dict[str, float]:
+        """Loss and accuracy on prefix states of the held-out functions, the same L per function in every call
+        (one seeded draw per micro-batch, K = 8's grid for the time input)."""
+        cfg = self.cfg
+        pooled = {"nll_sum": 0.0, "weight_sum": 0.0, "hits": 0.0, "masked": 0.0}
+        generator = torch.Generator().manual_seed(2_000)
+        for start in range(0, len(self.validation), cfg.micro_batch):
+            batch = collate(self.validation[start:start + cfg.micro_batch], cfg.canvas_len, self.tokenizer.eos_id)
+            state = prefix_state(batch, self.schedule, [8], self.tokenizer.mask_id, cfg.pad_weight, generator,
+                                 next_only=next_only)
+            _, stats = self.loss_on(batch, state=state, mode=mode, adapters=adapters)
+            for key in pooled:                                        # "masked" counts the scored positions
+                pooled[key] += stats[key]
+        return {f"val_loss_{name}": pooled["nll_sum"] / max(pooled["weight_sum"], 1e-8),
+                f"val_accuracy_{name}": pooled["hits"] / max(pooled["masked"], 1.0)}
 
     @torch.no_grad()
     def probe(self) -> dict[str, float]:
