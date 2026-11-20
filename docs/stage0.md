@@ -169,6 +169,40 @@ The probe (MBPP validation, K = 8) stayed between 0.0% and 0.7% from step 5,000 
 was still falling slowly at every state (all-masked 4.26 -> 4.08 nats from step 2,500 to 17,500; mostly revealed
 0.72 -> 0.53). The instruction-tuned row used its chat template and a 768-token budget; it is not part of H2.
 
+## Diagnostic sweep (20 Nov 2026, `runs/stage0/sweep`)
+
+MBPP validation (90 problems, 5 samples each), the final checkpoint; outside the protocol, no verdict.
+
+| decoder | Pass@1 | parses | mean depth |
+|---|---|---|---|
+| baseline, the released model's `generate` | 23.8% | 87.1% | 120 |
+| backbone through the realizer's code path (adapters off, causal, one token per step) | 24.7% | 89.8% | 118 |
+| realizer, left to right, K = 256 (one token per step) | 8.9% | 58.7% | 67 |
+| realizer, left to right, K = 256, (t, h) as in training | 8.0% | 59.3% | 65 |
+| realizer, left to right, K = 128 (one token per step for 42 positions, then 2 to 3) | 7.6% | 44.2% | 51 |
+| realizer, confidence order, K = 128 | 4.9% | 36.2% | 129 |
+| realizer, exact kernel, K = 128 | 0.7% | 20.7% | 129 |
+| realizer, exact kernel, K = 32 | 0.9% | 16.7% | 33 |
+| realizer, exact kernel, K = 32, (t, h) as in training | 0.7% | 16.0% | 33 |
+| realizer, confidence order, K = 32 | 0.0% | 5.1% | 33 |
+| realizer, left to right, K = 32 (blocks of about 4 to 6) | 0.0% | 3.1% | 16 |
+| realizer, exact kernel, K = 8 | 0.2% | 6.9% | 9 |
+| realizer, confidence order, K = 8 | 0.0% | 1.3% | 9 |
+| realizer, left to right, K = 8 (blocks of 5, 15, 24, 32) | 0.0% | 0.0% | 5 |
+
+What it shows:
+
+- **The implementation is verified on the real model.** The realizer's code path with the adapters off reproduces
+  the backbone (24.7% against 23.8%, within noise).
+- **The adaptation is the first bottleneck.** Decoding one token per step, the trained realizer keeps about 36% of
+  the backbone's Pass@1 (8.9 / 24.7). Inputs (t, h) taken from training change nothing (8.0%), so the cause is
+  not the step-size input. With this recipe H2 is out of reach at any K, before parallel decisions enter.
+- **Parallel decisions cost a further factor of about 10 at K = 32 and 40 at K = 8**, and the cost depends on the
+  order. The exact jump kernel (random positions) barely improves from K = 32 to K = 128 (0.9% and 0.7%): tokens
+  committed early far from any known context are guesses that are never revised. Committing contiguous blocks of
+  4 or more tokens fails completely (left to right at K = 32 and K = 8), because neighbours decided together
+  repeat each other.
+
 ## Reading the result
 
 - `python -m text_vpa.stage0.analyze --eval RUN/eval` sorts every sample into passed, empty, syntax error, wrong
