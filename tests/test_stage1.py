@@ -975,7 +975,7 @@ def _write_row(root, tag: str, solved: int, **summary) -> None:
 
 def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     from text_vpa.stage1 import report
-    from text_vpa.stage1.report import bootstrap_difference, delivery_verdict, step1_gate
+    from text_vpa.stage1.report import bootstrap_difference, delivery_verdict, gate_reading, step1_gate
 
     assert step1_gate(0.6, 0.52, 0.7).startswith("clearly at least 0.5") and "build the planner" in step1_gate(0.5, 0.3, 0.7)
     assert step1_gate(0.5, 0.3, 0.7).startswith("at least 0.5")
@@ -985,6 +985,10 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     assert step1_gate(float("nan"), 0, 0).startswith("undecided")
     assert "reaches" in delivery_verdict(0.93) and "NOT shown" in delivery_verdict(0.6)
     assert "not evaluated" in delivery_verdict(None)
+    # A band under 0.5 is read only once the delivery check has passed; at least 0.5 is read regardless.
+    assert gate_reading(0.05, 0.0, 0.09, 0.14).startswith("NOT READ") and gate_reading(0.3, 0.1, 0.4, None).startswith("NOT READ")
+    assert gate_reading(0.05, 0.0, 0.09, 0.95) == step1_gate(0.05, 0.0, 0.09)
+    assert gate_reading(0.6, 0.52, 0.7, 0.2) == step1_gate(0.6, 0.52, 0.7)
     rng = np.random.default_rng(0)
     a, b = (rng.random(300) < 0.5).astype(float), (rng.random(300) < 0.3).astype(float)
     diff, low, high = bootstrap_difference(a, b)
@@ -1005,6 +1009,7 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     assert report.main(["--eval", str(sweep), "--run", str(tmp_path / "run"), "--reference", str(reference)]) == 0
     result = json.loads((sweep / "report.json").read_text())
     assert math.isclose(result["gate"]["rho"], 0.5) and result["gate"]["verdict"].startswith("at least 0.5")
+    assert result["gate"]["band"] == result["gate"]["verdict"] and result["gate"]["problems"] == 10
     assert result["label"] == ORACLE_LABEL and result["delivery"]["kind_match"] == 0.95
     row = next(r for r in result["comparison"] if r["k"] == 8 and r["order"] == "exact kernel")
     assert row["oracle"] == 0.3 and row["null"] == 0.1 and row["no_plan"] == 0.0
@@ -1013,7 +1018,17 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
                                 "plan_gain": None, "val_loss_k0": None, "val_loss_null_k0": None, "gate_mean": 0.12}]
     text = (sweep / "report.md").read_text()
     assert text.splitlines()[0].endswith(f"({ORACLE_LABEL})") and text.count(ORACLE_LABEL) >= 4
-    assert "rho = 0.500" in text and "the structure reaches the realizer" in text
+    assert "rho = 0.500" in text and "the structure reaches the realizer" in text and "10 problems x 5 samples" in text
+
+    # The smoke run's situation: the oracle solves nothing at K = 8 and the plan has not reached the realizer.
+    smoke = tmp_path / "smoke"
+    _write_row(smoke, "oracle-K8", 0, plan="oracle", kind_match=0.26, line_count_match=0.1, **label)
+    _write_row(smoke, "oracle-K256-left_to_right", 4, plan="oracle", kind_match=0.14, line_count_match=0.0,
+               order="left_to_right", num_steps=256, canvas_len=256, **label)
+    assert report.main(["--eval", str(smoke), "--reference", str(reference)]) == 0
+    read = json.loads((smoke / "report.json").read_text())["gate"]
+    assert read["band"].startswith("clearly under 0.1") and read["verdict"].startswith("NOT READ")
+    assert "run step 2" not in (smoke / "report.md").read_text().split("## Did the structure")[0]
 
     # Without the baseline on the same problems the gate is not evaluated, and says why.
     assert report.main(["--eval", str(sweep), "--out", str(tmp_path / "alone")]) == 0

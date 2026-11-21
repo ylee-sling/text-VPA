@@ -272,8 +272,10 @@ The gate is the one above. Three checks decide whether its number can be read:
    mean share of lines that have the planned kind (`kind_match`; a missing or extra line counts as a miss) is at
    least 0.9. Parallel decisions play no part there, so a lower value means the structure did not reach the
    realizer (the bridge, or 5,000 steps at this learning rate), and then a ratio under 0.5 at the gate is **not**
-   read as "structure is not enough": the two lower bands wait until that is repaired. A ratio of at least 0.5
-   needs no such check. The null plan's `kind_match` on the same row is printed next to it.
+   read as "structure is not enough": the two lower bands wait until that is repaired, and the report prints
+   "NOT READ" in place of the band. A ratio of at least 0.5 needs no such check. The null plan's `kind_match` on
+   the same row is printed next to it. The metric is strict by construction: lines are compared by index, so a
+   sample that drops or adds one line early misses on every later line.
 3. **The plan's effect is read within the same weights.** The oracle run has 5,000 more adapter steps than
    `runs/stage0-a`; `null-K*` (the null plan) is the comparison that holds the weights fixed, with the caveat
    this document already names: a model trained to lean on a plan is weaker without it.
@@ -293,3 +295,26 @@ the start (a resumed run continues at the floor learning rate, which is too low 
   [0.45, 0.97]).
 - Not verified off the server: the real tokenizer's character offsets (the preflight checks them against decoded
   prefixes and stops the run if they disagree), memory and speed with the bridge (the smoke run measures both).
+
+### Smoke run on the L4 (21 Nov 2026, `runs/stage1-oracle-smoke`, commit `a75cae2`)
+
+30 steps from `runs/stage0-a/last.pt`, 8 MBPP validation problems x 2 samples. A check of the server, not a result.
+
+- Unit tests and the preflight pass on the server.
+- **Memory:** micro-batch 8 without activation checkpointing peaks at 22.2 of 23.5 GiB (Stage 0: 21.1), over the
+  92% limit, so the trainer switched checkpointing on (11.6 GiB). The math does not change.
+- **Speed: 0.152 steps/s** (Stage 0: 0.202), the cost of recomputing each block in the backward pass. 5,000 steps
+  take about 9.1 h, plus about 1 h of evaluations during training, then about 4 h of evaluation (11 configurations;
+  the gate's three rows and the delivery row come first, about 1.5 h). About 14 h in all, not the 10 h estimated
+  above.
+- After 30 steps the gates are at 0.001 (max 0.003; under Adam a parameter moves at most about the learning rate
+  per step), so the oracle and null rows are identical and `plan_gain_k0` is 0.000, as expected.
+- **The delivery metric's floor:** without a working plan, `kind_match` at one token per step is 0.140 (oracle and
+  null alike; 16 samples). At K = 8 it is 0.26, higher because long garbage canvases match the most frequent kind,
+  `assign`, by chance.
+- The step-0 comparison with `runs/stage0-a` is not possible in a smoke run (32 held-out functions and 1 probe
+  sample instead of 256 and 5); the full run makes it.
+- Fixed after the smoke run: its report printed "clearly under 0.1: run step 2" above a delivery check that had
+  not passed. The report now prints "NOT READ" there (`report.gate_reading`), and the gate line names the number of
+  problems and samples. `stage1.sh status` now prints the preflight's numbers and says when the step-0 comparison
+  is not possible.

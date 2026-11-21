@@ -27,8 +27,8 @@ Reading the oracle (added on 21 Nov 2026 while building it, before any run). A l
 enough" only if the structure reached the realizer. That is checked where parallel decisions play no part: at
 one token per step (``oracle-K256-left_to_right``) the samples must follow their plans, i.e. the mean share of
 lines with the planned kind (``kind_match``) must be at least 0.9. Below that, the two lower bands of the gate
-are not read as a statement about structure: the bridge or its training has to be looked at first. The band
-rho >= 0.5 needs no such check.
+are not read as a statement about structure: the bridge or its training has to be looked at first, and the report
+prints "not read" in place of the band (``gate_reading``). The band rho >= 0.5 needs no such check.
 
 The baseline is ``REFERENCE/mbpp/ar`` (the Stage 0 sweep of the checkpoint the oracle started from) or, without
 ``--reference``, ``EVAL/mbpp/ar``; it must have been scored on the same problems. The reference's
@@ -51,7 +51,7 @@ from text_vpa.stage1.oracle import PLAN_VARIANTS
 from text_vpa.stage1.plan import ORACLE_LABEL
 
 __all__ = ["BUILD", "CLOSED", "DELIVERY", "GATE_ROW", "bootstrap_difference", "delivery_row", "delivery_verdict",
-           "is_oracle_row", "render", "step1_gate"]
+           "gate_reading", "is_oracle_row", "render", "step1_gate"]
 
 STAGE = "stage1-oracle"
 BASELINE = "ar"
@@ -80,6 +80,15 @@ def step1_gate(rho: float, low: float, high: float) -> str:
             "with this realizer; steps 3 and 4 measure what the plan buys at K = 32 and K = 128, step 2 says " \
             "whether richer plans are worth designing"
     return ("clearly " if high < CLOSED else "") + "under 0.1: run step 2 (the latent oracle)"
+
+
+def gate_reading(rho: float, low: float, high: float, kind_match: float | None) -> str:
+    """The gate's band as it may be read: a band under 0.5 only once the delivery check has passed."""
+    band = step1_gate(rho, low, high)
+    if math.isnan(rho) or rho >= BUILD or (kind_match is not None and kind_match >= DELIVERY):
+        return band
+    return ("NOT READ: the delivery check below has not passed, so a ratio under 0.5 says nothing yet about "
+            "structure (docs/stage1.md, 'Reading the oracle')")
 
 
 def delivery_row(rows: dict[str, dict[str, Any]], plan: str = "oracle") -> str:
@@ -188,7 +197,8 @@ def render(result: dict[str, Any]) -> str:
     if gate.get("rho") is None:
         lines.append(f"- not evaluated: {gate['reason']}")
     else:
-        lines.append(f"- baseline {pct(gate['baseline'])}, oracle at K = 8 {pct(gate['oracle'])}: rho = "
+        lines.append(f"- {gate['problems']} problems x {gate['samples']} samples; baseline "
+                     f"{pct(gate['baseline'])}, oracle at K = 8 {pct(gate['oracle'])}: rho = "
                      f"{gate['rho']:.3f} [{gate['low']:.3f}, {gate['high']:.3f}]: {gate['verdict']}")
     lines += ["", "## Did the structure reach the realizer?", "",
               f"At one token per step (`{result['delivery']['row']}`) the samples must have the planned kind on at "
@@ -283,11 +293,15 @@ def main(argv: list[str] | None = None) -> int:
                               "(evaluate the baseline on this run's problems)")
         else:
             rho, low, high = bootstrap_ratio(*pair)
-            gate = {"rho": rho, "low": low, "high": high, "verdict": step1_gate(rho, low, high),
+            gate = {"rho": rho, "low": low, "high": high, "band": step1_gate(rho, low, high),
+                    "problems": oracle_rows[GATE_ROW].get("problems"),
+                    "samples": oracle_rows[GATE_ROW].get("samples_per_problem"),
                     "oracle": float(pair[0].mean()), "baseline": float(pair[1].mean()),
                     "baseline_dir": str(baseline_dir / BASELINE)}
     one_per_step = delivery_row(oracle_rows)
     delivered = oracle_rows.get(one_per_step, {}).get("kind_match")
+    if gate.get("rho") is not None:
+        gate["verdict"] = gate_reading(gate["rho"], gate["low"], gate["high"], delivered)
     delivery = {"row": one_per_step, "kind_match": delivered, "threshold": DELIVERY,
                 "verdict": delivery_verdict(delivered),
                 "null_kind_match": oracle_rows.get(delivery_row(oracle_rows, "null"), {}).get("kind_match")}

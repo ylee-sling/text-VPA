@@ -102,23 +102,54 @@ status() {
   echo "run: $RUN   ($LABEL)"
   echo "finished steps: $(ls "$RUN/done" 2>/dev/null | tr '\n' ' ')"
   if [[ -f "$RUN/memory.json" ]]; then echo "memory check: $(tr -d '\n' < "$RUN/memory.json" | tr -s ' ')"; fi
+  if [[ -f "$RUN/preflight.json" && -x "$PY" ]]; then
+    "$PY" - "$RUN/preflight.json" <<'EOF'
+import json, sys
+p = json.load(open(sys.argv[1], encoding="utf-8"))
+o, m, k, lines = p.get("offsets", {}), p.get("mbpp_validation", {}), p.get("skeletons", {}), p.get("lines", {})
+print(f"preflight: token offsets give the same slots as decoded prefixes for {o.get('corpus_same_slots', 0):.1%} "
+      f"of {o.get('corpus_programs')} corpus canvases and {o.get('mbpp_same_slots', 0):.1%} of MBPP's references")
+print(f"  MBPP validation references: {m.get('normalised')}/{m.get('problems')} normalise, pass "
+      f"{m.get('pass_as_written')} as written and {m.get('pass_normalised')} normalised; indented in fours "
+      f"{m.get('indented_in_fours_as_written', 0):.0%} -> {m.get('indented_in_fours_normalised', 0):.0%}; "
+      f"within {p.get('max_slots')} slots {m.get('within_slots', 0):.0%}")
+print("  corpus within slots: " + ", ".join(f"{name.split('_', 1)[1]} {v.get('within_slots', 0):.1%} "
+                                             f"(indented in fours {v.get('indented_in_fours', 0):.1%})"
+                                             for name, v in lines.items()))
+for key in ("with_depth", "without_depth"):
+    v = k.get(key, {})
+    print(f"  skeletons {key.replace('_', ' ')}: codebook from {v.get('programs')} programs ({v.get('distinct')} "
+          f"distinct); covers held-out corpus {v.get('held_out', 0):.1%}, MBPP validation "
+          f"{v.get('mbpp_validation', 0):.1%}")
+print(f"  {k.get('rule', '')} (for step 3; read it on the full run's codebook, not a smoke run's)")
+if p.get("problems"):
+    print("  PROBLEMS: " + "; ".join(p["problems"]))
+EOF
+  fi
   if [[ -f "$RUN/metrics.jsonl" && -x "$PY" ]]; then
-    "$PY" - "$RUN/metrics.jsonl" "$(dirname "$INIT")/metrics.jsonl" <<'EOF'
+    "$PY" - "$RUN/metrics.jsonl" "$(dirname "$INIT")" "$RUN/config.json" <<'EOF'
 import json, os, sys
 rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
 # The gates start closed, so the evaluation at step 0 must repeat the last evaluation of the Stage 0 run the
-# oracle started from (same held-out functions, same draws, same probe seeds). A smoke run evaluates fewer
-# functions and samples and is not comparable.
+# oracle started from (same held-out functions, same draws, same probe seeds), if both evaluate the same things.
 start = next((r for r in rows if r["step"] == 0 and "eval/val_loss" in r), None)
-if start and os.path.exists(sys.argv[2]):
-    before = [r for r in map(json.loads, open(sys.argv[2], encoding="utf-8")) if "eval/val_loss" in r]
-    if before:
-        pairs = [(k, start[k], before[-1][k]) for k in ("eval/val_loss", "eval/val_loss_next", "eval/probe_pass@1")
-                 if k in start and k in before[-1]]
+init_metrics, init_config = os.path.join(sys.argv[2], "metrics.jsonl"), os.path.join(sys.argv[2], "config.json")
+if start and os.path.exists(init_metrics):
+    before = [r for r in map(json.loads, open(init_metrics, encoding="utf-8")) if "eval/val_loss" in r]
+    keys = ("val_examples", "probe_samples", "probe_steps")
+    mine = json.load(open(sys.argv[3])) if os.path.exists(sys.argv[3]) else {}
+    theirs = json.load(open(init_config)) if os.path.exists(init_config) else {}
+    differ = [f"{key} {mine.get(key)} against {theirs.get(key)}" for key in keys if mine.get(key) != theirs.get(key)]
+    if before and differ:
+        print("step 0 against the Stage 0 run: not comparable, this run evaluates other things ("
+              + ", ".join(differ) + "; a smoke run)")
+    elif before:
+        pairs = [(key, start[key], before[-1][key]) for key in ("eval/val_loss", "eval/val_loss_next",
+                                                                "eval/probe_pass@1") if key in start and key in before[-1]]
         same = all(abs(a - b) <= 2e-3 * max(abs(b), 1.0) for _, a, b in pairs)
         print(f"step 0 against the Stage 0 run's last evaluation (step {before[-1]['step']}): "
-              + ", ".join(f"{k.split('/')[1]} {a:.4f} / {b:.4f}" for k, a, b in pairs)
-              + ("   -> the same" if same else "   -> DIFFERENT (expected only in a smoke run)"))
+              + ", ".join(f"{key.split('/')[1]} {a:.4f} / {b:.4f}" for key, a, b in pairs)
+              + ("   -> the same" if same else "   -> DIFFERENT: a bug, stop the run (docs/stage1.md)"))
 train = [r for r in rows if "train/loss" in r]
 if train:
     r = train[-1]
