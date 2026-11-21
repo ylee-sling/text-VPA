@@ -405,11 +405,15 @@ class CorpusStream:
                 self.dropped["not_prefix"] += 1
                 continue
             pairs.append((made[0], made[1], kind))
-        examples, dropped = tokenize_examples(pairs, self.tokenizer, self.canvas_len, self.max_prompt_tokens)
+        examples, dropped = self.tokenize(pairs)
         for key, value in dropped.items():
             self.dropped[key] += value
         rng.shuffle(examples)
         return examples
+
+    def tokenize(self, pairs: Sequence[tuple[str, str, str]]) -> tuple[list[Example], dict[str, int]]:
+        """``tokenize_examples`` on a chunk's pairs (the planner stage overrides it to add line slots)."""
+        return tokenize_examples(pairs, self.tokenizer, self.canvas_len, self.max_prompt_tokens)
 
     def _examples(self) -> Iterator[Example]:
         skip = self._start["taken"]
@@ -430,8 +434,9 @@ class CorpusStream:
 
 
 def load_validation(corpus_dir: str | Path, tokenizer: Stage0Tokenizer, canvas_len: int, max_prompt_tokens: int,
-                    limit: int, seed: int = 0) -> list[Example]:
-    """The first ``limit`` usable examples of ``val.jsonl.gz``, alternating the two formats where possible."""
+                    limit: int, seed: int = 0, tokenize: Any = None) -> list[Example]:
+    """The first ``limit`` usable examples of ``val.jsonl.gz``, alternating the two formats where possible.
+    ``tokenize`` replaces ``tokenize_examples`` (same arguments; the planner stage adds line slots)."""
     path = Path(corpus_dir) / "val.jsonl.gz"
     pairs: list[tuple[str, str, str]] = []
     with gzip.open(path, "rt", encoding="utf-8") as handle:
@@ -445,5 +450,5 @@ def load_validation(corpus_dir: str | Path, tokenizer: Stage0Tokenizer, canvas_l
                 pairs.append((made[0], made[1], kind))
             if len(pairs) >= 3 * limit:
                 break
-    examples, _ = tokenize_examples(pairs, tokenizer, canvas_len, max_prompt_tokens)
+    examples, _ = (tokenize or tokenize_examples)(pairs, tokenizer, canvas_len, max_prompt_tokens)
     return examples[:limit]

@@ -129,7 +129,14 @@ def learning_rate(step: int, cfg: Stage0Config) -> float:
 
 
 class Stage0Trainer:
-    """The training loop. ``realizer`` is on ``device``; ``stream`` yields examples; ``validation`` is fixed."""
+    """The training loop. ``realizer`` is on ``device``; ``stream`` yields examples; ``validation`` is fixed.
+
+    The planner stage trains the same realizer with a plan (``text_vpa.stage1.train``) and reuses this loop:
+    what it changes is behind ``trainable_parameters``, ``set_training``, ``collate``, ``canvas_pass`` and
+    ``extra_state`` / ``load_extra_state``, so states, loss, optimizer and schedule stay Stage 0's.
+    """
+
+    stage = "stage0"
 
     def __init__(self, realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, cfg: Stage0Config,
                  stream: CorpusStream, validation: Sequence[Example], run_dir: str | Path, device: torch.device,
@@ -139,12 +146,37 @@ class Stage0Trainer:
         self.probe_tasks = list(probe_tasks)
         self.schedule = KappaSchedule(cfg.schedule)
         self.generator = torch.Generator().manual_seed(cfg.seed)
-        self.optimizer = torch.optim.AdamW(realizer.trainable_parameters(), lr=cfg.lr, betas=(0.9, 0.999),
+        self.optimizer = torch.optim.AdamW(self.trainable_parameters(), lr=cfg.lr, betas=(0.9, 0.999),
                                            weight_decay=cfg.weight_decay)
         self.step = 0
         self.logger = logger or MetricLogger(self.run_dir)
         self.examples_seen = 0
         self._backbone_next: dict[str, float] | None = None     # the frozen backbone's, computed once
+
+    # -- what a later stage changes --------------------------------------------------------------
+    def trainable_parameters(self) -> list[torch.nn.Parameter]:
+        return self.realizer.trainable_parameters()
+
+    def set_training(self, mode: bool) -> None:
+        self.realizer.train(mode)
+
+    def collate(self, examples: Sequence[Example]) -> Batch:
+        return collate(examples, self.cfg.canvas_len, self.tokenizer.eos_id)
+
+    def canvas_pass(self, batch: Batch, state: TrainingState, cache: Any, mode: str, adapters: bool
+                    ) -> torch.Tensor:
+        """The realizer's pass over the canvas of ``batch`` in ``state``: ``[B, N + 1, d]``."""
+        dev = self.device
+        return self.realizer.canvas_hidden(
+            cache, state.canvas_ids.to(dev), state.is_mask.to(dev), state.t.to(dev), state.h.to(dev),
+            mode=mode, adapters=adapters, checkpointing=self.cfg.grad_checkpoint and torch.is_grad_enabled())
+
+    def extra_state(self) -> dict[str, Any]:
+        """What a checkpoint holds beyond the realizer's adapters, the optimizer and the data position."""
+        return {}
+
+    def load_extra_state(self, payload: dict[str, Any]) -> None:
+        return None
 
     # -- one micro-batch -----------------------------------------------------------------------
     def loss_on(self, batch: Batch, budget: int | None = None, step_index: int | None = None,
@@ -162,9 +194,7 @@ class Stage0Trainer:
                                    step_index, prefix_fraction=cfg.prefix_fraction)
         with autocast(dev):
             cache = self.realizer.prefill(*left_pad(batch.prefix_rows, self.tokenizer.pad_id, dev))
-            hidden = self.realizer.canvas_hidden(
-                cache, state.canvas_ids.to(dev), state.is_mask.to(dev), state.t.to(dev), state.h.to(dev),
-                mode=mode, adapters=adapters, checkpointing=cfg.grad_checkpoint and torch.is_grad_enabled())
+            hidden = self.canvas_pass(batch, state, cache, mode, adapters)
             predicted = hidden[:, : cfg.canvas_len]                  # index j predicts canvas token j + 1
             weights = state.weights.to(dev)
             chosen = weights > 0
@@ -183,13 +213,13 @@ class Stage0Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         pooled = {"nll_sum": 0.0, "weight_sum": 0.0, "hits": 0.0, "masked": 0.0}
         for _ in range(cfg.grad_accum):
-            batch = collate(self.stream.take(cfg.micro_batch), cfg.canvas_len, self.tokenizer.eos_id)
+            batch = self.collate(self.stream.take(cfg.micro_batch))
             loss, stats = self.loss_on(batch)
             (loss / cfg.grad_accum).backward()
             for key in pooled:
                 pooled[key] += stats[key]
             self.examples_seen += cfg.micro_batch
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.realizer.trainable_parameters(), cfg.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), cfg.grad_clip)
         if not bool(torch.isfinite(grad_norm)):
             raise FloatingPointError(f"non-finite gradient norm at step {self.step}")
         self.optimizer.step()
@@ -204,15 +234,14 @@ class Stage0Trainer:
         on prefix states: every masked position (``prefix``), the next token alone (``next``) and the frozen
         backbone's next-token loss on the same tokens (``next_backbone``, computed on the first call)."""
         cfg = self.cfg
-        self.realizer.eval()
+        self.set_training(False)
         out: dict[str, float] = {}
         sums = {"nll_sum": 0.0, "weight_sum": 0.0, "hits": 0.0, "masked": 0.0}
         for k in (0, 2, 4, 6):
             at_k = {"nll_sum": 0.0, "weight_sum": 0.0, "hits": 0.0, "masked": 0.0}
             generator = torch.Generator().manual_seed(1_000 + k)
             for start in range(0, len(self.validation), cfg.micro_batch):
-                batch = collate(self.validation[start:start + cfg.micro_batch], cfg.canvas_len,
-                                self.tokenizer.eos_id)
+                batch = self.collate(self.validation[start:start + cfg.micro_batch])
                 _, stats = self.loss_on(batch, budget=8, step_index=k, generator=generator)
                 for key in at_k:
                     at_k[key] += stats[key]
@@ -228,7 +257,7 @@ class Stage0Trainer:
             self._backbone_next = self._prefix_metrics("next_backbone", next_only=True, mode="causal",
                                                        adapters=False)
         out.update(self._backbone_next)
-        self.realizer.train()
+        self.set_training(True)
         return out
 
     def _prefix_metrics(self, name: str, next_only: bool, mode: str = "bidirectional", adapters: bool = True
@@ -239,7 +268,7 @@ class Stage0Trainer:
         pooled = {"nll_sum": 0.0, "weight_sum": 0.0, "hits": 0.0, "masked": 0.0}
         generator = torch.Generator().manual_seed(2_000)
         for start in range(0, len(self.validation), cfg.micro_batch):
-            batch = collate(self.validation[start:start + cfg.micro_batch], cfg.canvas_len, self.tokenizer.eos_id)
+            batch = self.collate(self.validation[start:start + cfg.micro_batch])
             state = prefix_state(batch, self.schedule, [8], self.tokenizer.mask_id, cfg.pad_weight, generator,
                                  next_only=next_only)
             _, stats = self.loss_on(batch, state=state, mode=mode, adapters=adapters)
@@ -254,12 +283,12 @@ class Stage0Trainer:
         if not self.probe_tasks:
             return {}
         cfg = self.cfg
-        self.realizer.eval()
+        self.set_training(False)
         sampler = SamplerConfig(num_steps=cfg.probe_steps, schedule=cfg.schedule)
         texts, _ = realizer_samples(self.realizer, self.tokenizer, self.probe_tasks, "mbpp", sampler, cfg.canvas_len,
                                     cfg.probe_samples, cfg.probe_samples, seed=7, device=self.device)
         summary, _ = score(self.probe_tasks, "mbpp", texts, [1])
-        self.realizer.train()
+        self.set_training(True)
         return {"probe_pass@1": summary["pass@1"], "probe_parse_rate": summary["parse_rate"]}
 
     # -- memory --------------------------------------------------------------------------------
@@ -268,7 +297,7 @@ class Stage0Trainer:
         filler = tok.eos_id + 10 if tok.eos_id + 10 < tok.vocab_size else tok.eos_id
         example = Example([tok.bos_id] + [filler] * (cfg.max_prompt_tokens - 1), [filler] * (cfg.canvas_len - 1)
                           + [tok.eos_id], "complete")
-        return collate([example] * micro_batch, cfg.canvas_len, tok.eos_id)
+        return self.collate([example] * micro_batch)
 
     def fit_memory(self) -> dict[str, Any]:
         """Find a micro-batch setting whose worst case fits the device; updates ``cfg`` in place."""
@@ -309,7 +338,8 @@ class Stage0Trainer:
     # -- persistence ---------------------------------------------------------------------------
     def save(self, name: str = "last.pt") -> Path:
         return save_checkpoint(self.run_dir / name, {
-            "stage": "stage0", "step": self.step, "examples_seen": self.examples_seen,
+            **self.extra_state(),
+            "stage": self.stage, "step": self.step, "examples_seen": self.examples_seen,
             "spec": {**self.realizer.spec.to_dict(), "lora_targets": list(self.realizer.spec.lora_targets)},
             "config": self.cfg.to_dict(), "trainable": self.realizer.trainable_state(),
             "optimizer": self.optimizer.state_dict(), "stream": self.stream.state(),
@@ -318,6 +348,7 @@ class Stage0Trainer:
 
     def restore(self, payload: dict[str, Any]) -> None:
         self.realizer.load_trainable_state(payload["trainable"])
+        self.load_extra_state(payload)
         self.optimizer.load_state_dict(payload["optimizer"])
         self.generator.set_state(payload["generator"].to(device="cpu", dtype=torch.uint8))
         self.step, self.examples_seen = int(payload["step"]), int(payload.get("examples_seen", 0))
@@ -330,7 +361,7 @@ class Stage0Trainer:
 
     def fit(self) -> None:
         cfg = self.cfg
-        self.realizer.train()
+        self.set_training(True)
         if self.step == 0:
             self.evaluate()                                          # the untrained realizer: the curve's origin
         window: list[dict[str, float]] = []
@@ -375,12 +406,12 @@ def _overrides(cfg: Stage0Config, pairs: Sequence[str]) -> Stage0Config:
     for pair in pairs:
         key, _, raw = pair.partition("=")
         if key not in data:
-            raise SystemExit(f"unknown Stage0Config field {key!r}")
+            raise SystemExit(f"unknown {type(cfg).__name__} field {key!r}")
         try:
             data[key] = json.loads(raw)
         except json.JSONDecodeError:
             data[key] = raw
-    return Stage0Config.from_dict(data)
+    return type(cfg).from_dict(data)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -390,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
     last = args.run / "last.pt"
     payload = load_checkpoint(last) if last.exists() else None
     if payload is not None:
+        if payload.get("stage", "stage0") != "stage0":
+            raise SystemExit(f"{last} is a {payload['stage']!r} checkpoint, not a Stage 0 run")
         cfg = Stage0Config.from_dict(payload["config"])
         if args.set:
             print("resuming: --set is ignored (the run's configuration is in its checkpoint)", file=sys.stderr)

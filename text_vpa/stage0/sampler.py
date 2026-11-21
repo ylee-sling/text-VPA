@@ -47,12 +47,18 @@ argmax.
 
 Depth: one prefill of the prompt by the frozen backbone and K canvas passes, K + 1 sequential evaluations
 (fewer for a left-to-right row that has stopped).
+
+With a plan (the planner stage, ``text_vpa.stage1.bridge``): ``plan`` holds the keys and values of the plan for
+every block, projected once before the first step, and each canvas pass attends to them. The depth audit then
+also checks that nothing was projected again during the K passes and that every block of every pass used the
+cache; the projections are part of the first canvas pass and add no sequential evaluation.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -165,7 +171,8 @@ def _draw_in_chunks(realizer: Stage0Realizer, hidden: Tensor, cfg: SamplerConfig
 def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas_len: int, cfg: SamplerConfig,
             forbidden: Sequence[int] = (), generator: torch.Generator | None = None,
             mode: str = "bidirectional", stop_id: int | None = None, adapters: bool = True,
-            row_done: Callable[[Tensor], Tensor] | None = None, check_every: int = 8) -> RealizeResult:
+            row_done: Callable[[Tensor], Tensor] | None = None, check_every: int = 8,
+            plan: Any = None) -> RealizeResult:
     """K parallel steps from the all-[MASK] canvas.
 
     Args:
@@ -179,6 +186,7 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         adapters: False runs the frozen backbone on the canvas (LoRA and modulation off).
         row_done: left-to-right order only, needs ``stop_id``: ``[B, N]`` tokens (a revealed prefix, then [MASK])
             -> ``[B]`` bool, True once a row's output is final; checked every ``check_every`` steps.
+        plan: a ``PlanCache`` with one row per sample (the planner stage); None is Stage 0.
     """
     if row_done is not None and stop_id is None:
         raise ValueError("row_done needs stop_id (it fills the rest of a finished row)")
@@ -191,6 +199,8 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
     tokens = torch.full((b, canvas_len), mask_id, dtype=torch.long, device=device)
     front = torch.zeros(b, 1, dtype=torch.bool, device=device)
     passes_before = realizer.passes["canvas"]
+    with_plan = {} if plan is None else {"plan": plan}
+    plan_before = None if plan is None else plan.audit()
     revealed: list[int] = []
     row_passes = torch.full((b,), cfg.num_steps, dtype=torch.long, device=device)
     stopped = torch.zeros(b, dtype=torch.bool, device=device)
@@ -201,7 +211,7 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
         t_in, h_in = network_time(cfg, schedule, t, h, masked)
         hidden = realizer.canvas_hidden(
             cache, torch.cat([anchor[:, None], tokens], dim=1), torch.cat([front, masked], dim=1), t_in, h_in,
-            mode=mode, adapters=adapters,
+            mode=mode, adapters=adapters, **with_plan,
         )[:, :canvas_len]                                           # index j predicts canvas token j + 1
         pi = 1.0 if last else float(schedule.exact_jump_mass(t, h))
         if cfg.order == "random":
@@ -242,4 +252,6 @@ def realize(realizer: Stage0Realizer, cache: PrefixCache, anchor: Tensor, canvas
     canvas_passes = realizer.passes["canvas"] - passes_before
     if canvas_passes != executed or (stop_id is None and canvas_passes != cfg.num_steps):
         raise RuntimeError(f"depth audit: {canvas_passes} canvas passes for K = {cfg.num_steps}")
+    if plan is not None:
+        plan.check_audit(plan_before, canvas_passes)
     return RealizeResult(tokens, revealed, canvas_passes, canvas_passes + 1, row_passes)

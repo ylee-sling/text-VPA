@@ -36,6 +36,8 @@ decisions below. Read the relevant section of the PDF before changing any math.
 | `text_vpa/stage0/` | Text-VPA Sec. 3, Sec. 6 (Stage 0) | the plan-free Gemma 4 E2B realizer: `backbone.py` (prompt prefill by the frozen backbone, canvas-only LoRA, bidirectional canvas, mask embedding, zero-init (t, h) modulation, AR shift with a clamped anchor), `data.py`, `sampler.py` (exact jump kernel on the mask source), `autoregressive.py` (the baseline: the model's own `generate`), `postprocess.py`, `train.py`, `evaluate.py`, `report.py` (H2 verdict, one-token-per-step gate), `analyze.py` (how samples failed, def-line check), `preflight.py` |
 | `scripts/ncp/stage0.sh` | — | Stage 0 on the NCP L4 server, resumable; never shuts the server down. `VALIDATION_ONLY=1`: train a changed recipe, then the sweep on MBPP validation only (no test set, no H2 verdict) |
 | `scripts/ncp/stage0_sweep.sh` | — | diagnostic after Stage 0, outside the protocol, on MBPP validation: a code check (the backbone's own decoding through the realizer's code path), the adapted realizer one token per step, and three orders (exact kernel, confidence, left to right) at K = 8 to 128; `STAGES` picks and orders the stages; its report decides the one-token-per-step gate |
+| `text_vpa/stage1/` | Text-VPA planner stage, step 1 (`docs/stage1.md`) | the structure oracle, a diagnostic that is never the method: `slots.py` (line slots: kind, depth, start, length; fixed position and layout codes; line skeletons and their codebook), `bridge.py` (`PlanBridge`: gated cross-attention from every realizer block to a plan, keys and values projected once into a `PlanCache`, null plan, the audit), `plan.py` (`OraclePlan`, `ORACLE_LABEL`), `oracle.py` (`StructureOracle`, the normalised reference at evaluation, `kind_match`), `data.py` (Stage 0's examples with slots), `train.py` (`OracleTrainer`, from a Stage 0 checkpoint), `evaluate.py`, `report.py` (the gate after step 1, the delivery check), `preflight.py`. Not built: the planner, the realizer on predicted plans, the latent oracle |
+| `scripts/ncp/stage1.sh` | — | the structure oracle on the NCP L4 server, resumable, with a smoke mode; preflight → training from `runs/stage0-a/last.pt` → evaluation on MBPP validation (`STAGES`: gate, delivery, confidence, null, shuffled) → report; never shuts the server down |
 | `scripts/init_repo.sh`, `scripts/release.sh` | — | git setup; checks → commit → tag → push |
 | `scripts/gcp/` | — | `create_vm.sh` (g2-standard-16), `setup_vm.sh`, `train_l4.sh` (resumable pipeline; `CORPUS=shards` all of github-code-clean, up to 2M functions, or `export`; corpus recipe and run-corpus guards; Pass@k with and without energies), `run_all.sh` (one-shot unattended: setup + pipeline in tmux, @reboot resume, shutdown, outcome markers per run directory; on a reused VM: clean environment, uv Python 3.12 if missing, CUDA 12.6 torch for drivers < 580), `preflight.sh` (read-only VM checks), `overfit_check.sh` (can Stage 2 memorize a few hundred functions?) |
 
@@ -50,6 +52,7 @@ python -m text_vpa.utils.verification        # Appendix B checks; must reproduce
 python -m text_vpa.utils.profiler --roofline # must reproduce Table 3
 python evaluate.py --benchmark humaneval --data HumanEval.jsonl.gz --reference --out /tmp/he  # harness: 164/164
 python -m pytest tests/test_stage0.py tests/test_stage0_cli.py   # Stage 0, on a tiny random Gemma 4
+python -m pytest tests/test_stage1.py tests/test_stage1_cli.py   # the planner stage's step 1, likewise
 ```
 
 ## Non-negotiable rules
@@ -91,6 +94,31 @@ own rules:
    function only (`assert name(...) == ...`). The first run listed the parameter names there and the realizer
    learned to copy an assert's arguments into its `def` line (38% invalid `def` lines on MBPP). After any change
    to a prompt format, run `analyze.py --mbpp` on samples before reading Pass@1.
+
+## Stage 1 (Text-VPA planner stage; `text_vpa/stage1/`, design, gates and choices in `docs/stage1.md`)
+
+Built so far: step 1, the structure oracle. Its rules:
+
+1. **An oracle is a diagnostic, never the method.** It conditions the realizer on the reference, which rule 4
+   above forbids for the method. Its plan is an `OraclePlan` (rejected by `require_predicted_plan`); its
+   checkpoints, summaries and reports carry `ORACLE_LABEL`; `stage1/report.py` refuses a row or a text without
+   it; Stage 0's `evaluate` and `train` refuse a `stage1-oracle` checkpoint. Do not weaken any of these, and
+   never put an oracle number in a table of results except as a labelled upper bound.
+2. **A closed gate is the Stage 0 realizer, exactly.** The bridge's gates start at zero and step 0 of a run must
+   reproduce the checkpoint it starts from (tested bit for bit; `stage1.sh status` compares the two runs).
+   Anything new on the realizer's path starts at zero in the same way.
+3. **Where the bridge enters a block.** `PlanBridge.attach` wraps `input_layernorm` and
+   `post_attention_layernorm` of every Gemma 4 block and relies on the order of the block's forward pass. Keep
+   `test_the_bridge_enters_each_block_after_self_attention_on_the_canvas_only` (a block written out by hand) when
+   transformers is upgraded. The plan is an argument of `Stage0Realizer._block`, like the adapter switch.
+4. **Keys and values are projected once per generation.** `PlanCache.check_audit` runs inside `sampler.realize`
+   and raises otherwise; never remove or weaken it (rule 3 above, for this realizer).
+5. **Gates and reading rules are fixed in `docs/stage1.md` before a run**, results are read by them, and every
+   diagnostic uses MBPP's validation split.
+6. **The reference is normalised at evaluation** (`oracle.normalize_reference`: MBPP's solutions are mostly not
+   indented in fours); training plans are read from the corpus text as it is. The oracle is MBPP-only.
+7. **Slots are a function of the canvas text and the tokenizer's character offsets.** The preflight checks the
+   offsets against decoded prefixes; do not train if it fails.
 
 ## Tests
 

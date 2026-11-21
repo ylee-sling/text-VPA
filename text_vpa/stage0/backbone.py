@@ -92,11 +92,17 @@ class RealizerSpec:
 
 class AdapterState:
     """Switch shared by every adapter of one realizer: off while the frozen backbone runs (prefill), on for the
-    canvas. ``modulation`` is ``[B, L, 4, d]`` (shift and scale for the two pre-norms of each block) or None."""
+    canvas. ``modulation`` is ``[B, L, 4, d]`` (shift and scale for the two pre-norms of each block) or None.
+
+    ``plan`` and ``residual`` belong to the planner stage (``text_vpa.stage1.bridge``): the cached keys and
+    values of a plan while a canvas block runs with one, and that block's input. Stage 0 leaves both at None.
+    """
 
     def __init__(self) -> None:
         self.active: bool = False
         self.modulation: Tensor | None = None
+        self.plan: Any = None
+        self.residual: Tensor | None = None
 
 
 class LoRALinear(nn.Module):
@@ -369,28 +375,30 @@ class Stage0Realizer(nn.Module):
         return embeds, per_layer
 
     def _block(self, hidden: Tensor, layer_input: Tensor | None, *, index: int, active: bool,
-               modulation: Tensor | None, **kwargs: Any) -> Tensor:
+               modulation: Tensor | None, plan: Any = None, **kwargs: Any) -> Tensor:
         """Block ``index`` with the adapter switch set for the duration of the call. The switch is an argument,
-        not ambient state, because activation checkpointing calls this again during the backward pass."""
-        previous = (self.state.active, self.state.modulation)
-        self.state.active, self.state.modulation = active, modulation
+        not ambient state, because activation checkpointing calls this again during the backward pass. The
+        same holds for ``plan`` (the planner stage's cached keys and values; None in Stage 0)."""
+        previous = (self.state.active, self.state.modulation, self.state.plan)
+        self.state.active, self.state.modulation, self.state.plan = active, modulation, plan
         try:
             return self.text.layers[index](hidden, layer_input, **kwargs)
         finally:
-            self.state.active, self.state.modulation = previous
+            self.state.active, self.state.modulation, self.state.plan = previous
+            self.state.residual = None
 
     def _run(self, hidden: Tensor, per_layer: Tensor | None, position_ids: Tensor, masks: dict[str, Tensor],
              cache: Any, num_layers: int, checkpointing: bool, active: bool = False,
-             modulation: Tensor | None = None) -> Tensor:
+             modulation: Tensor | None = None, plan: Any = None) -> Tensor:
         """Blocks 0 .. num_layers-1 of the backbone (the loop of ``Gemma4TextModel.forward``)."""
         masks = _for_implementation(masks, self._implementation, hidden.dtype)
         rotary = {kind: self.text.rotary_emb(hidden, position_ids, kind) for kind in set(self.layer_types)}
         shared: UserDict = UserDict()
         for i in range(num_layers):
             kind = self.layer_types[i]
-            block = partial(self._block, index=i, active=active, modulation=modulation, shared_kv_states=shared,
-                            position_embeddings=rotary[kind], attention_mask=masks[kind],
-                            position_ids=position_ids, past_key_values=cache)
+            block = partial(self._block, index=i, active=active, modulation=modulation, plan=plan,
+                            shared_kv_states=shared, position_embeddings=rotary[kind],
+                            attention_mask=masks[kind], position_ids=position_ids, past_key_values=cache)
             layer_input = per_layer[:, :, i, :] if per_layer is not None else None
             if checkpointing and torch.is_grad_enabled():
                 hidden = checkpoint(block, hidden, layer_input, use_reentrant=False)
@@ -423,7 +431,8 @@ class Stage0Realizer(nn.Module):
         return PrefixCache(recorder.keys, recorder.values, pos, valid)
 
     def canvas_hidden(self, cache: PrefixCache, canvas_ids: Tensor, is_mask: Tensor, t: Tensor, h: Tensor,
-                      mode: str = "bidirectional", adapters: bool = True, checkpointing: bool = False) -> Tensor:
+                      mode: str = "bidirectional", adapters: bool = True, checkpointing: bool = False,
+                      plan: Any = None) -> Tensor:
         """One realizer pass over the canvas.
 
         Args:
@@ -433,18 +442,22 @@ class Stage0Realizer(nn.Module):
             t, h: ``[B]`` flow time and step size.
             mode: ``bidirectional`` (the realizer) or ``causal`` (the backbone's masks).
             adapters: False runs the frozen backbone on the canvas (tests, ablations).
+            plan: the planner stage's ``PlanCache`` (``text_vpa.stage1.bridge``; the bridge must be attached):
+                every block then adds its gated cross-attention to the plan on the canvas. None: Stage 0.
 
         Returns:
             ``[B, C, d]`` final hidden states (after the last norm); index j - 1 predicts canvas token j.
         """
         if bool(is_mask[:, 0].any()):
             raise ValueError("the anchor (canvas index 0) is clamped and can never be [MASK]")
+        if plan is not None and not adapters:
+            raise ValueError("a plan acts through the realizer's adapters; adapters=False is the frozen backbone")
         canvas_pos = cache.lengths[:, None] + torch.arange(canvas_ids.shape[1], device=canvas_ids.device)[None]
         masks = canvas_masks(cache.pos, cache.valid, canvas_pos, self.window, mode)
         modulation = self.modulation(t, h) if adapters else None
         embeds, per_layer = self._embed(canvas_ids, is_mask)
         hidden = self._run(embeds, per_layer, canvas_pos, masks, cache, self.num_layers, checkpointing,
-                           active=adapters, modulation=modulation)
+                           active=adapters, modulation=modulation, plan=plan)
         hidden = self.text.norm(hidden)
         self.passes["canvas"] += 1
         return hidden

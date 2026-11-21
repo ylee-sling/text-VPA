@@ -1,8 +1,12 @@
 # Text-VPA Stage 1: a planner on the Stage 0 realizer (design)
 
-Written on 21 Nov 2026, after the second Stage 0 run. **Nothing in this document has been built or run.** It
-fixes the order of experiments, their gates and the open choices before any of them exists, in the way
-`docs/stage0.md` did for Stage 0.
+Written on 21 Nov 2026, after the second Stage 0 run. It fixes the order of experiments, their gates and the open
+choices before any of them exists, in the way `docs/stage0.md` did for Stage 0.
+
+**Status (21 Nov 2026, evening).** The author confirmed the design's three open choices: slots are lines, modes
+are line skeletons, the bridge has no s_x rows. Step 1, the structure oracle, is built (branch `stage1-planner`;
+"Step 1 as built" at the end of this document). **Nothing has been run on the real model**, and steps 2 to 4 are
+not built. The gates below are unchanged.
 
 ## The question
 
@@ -184,17 +188,108 @@ continued for the same steps without a bridge.
 
 ## What gets built
 
-| module | contents |
-|---|---|
-| `text_vpa/stage1/slots.py` | line slots, kinds, depths, layout code, skeletons, the mode codebook |
-| `text_vpa/stage1/planner.py` | the head and its EMA copy on backbone states; wiring of `ModeSelector`, `JEPAPredictor`, `PlanLoss` |
-| `text_vpa/stage1/bridge.py` | gated cross-attention for `Stage0Realizer`, cached keys and values, null plan |
-| `text_vpa/stage1/train.py` | Stage 1 (planner), Stage 2 (realizer on predicted plans), the oracle diagnostics |
-| `text_vpa/stage0/evaluate.py`, `report.py`, `analyze.py` | `--planner`, the plan variants, the gates of this document |
-| `scripts/ncp/stage1.sh` | resumable pipeline; smoke mode; never shuts the server down |
+| module | contents | built |
+|---|---|---|
+| `text_vpa/stage1/slots.py` | line slots, kinds, depths, layout code, skeletons, the mode codebook | yes |
+| `text_vpa/stage1/planner.py` | the head and its EMA copy on backbone states; wiring of `ModeSelector`, `JEPAPredictor`, `PlanLoss` | no (step 3) |
+| `text_vpa/stage1/bridge.py` | gated cross-attention for `Stage0Realizer`, cached keys and values, null plan | yes |
+| `text_vpa/stage1/train.py` | Stage 1 (planner), Stage 2 (realizer on predicted plans), the oracle diagnostics | the structure oracle only |
+| `text_vpa/stage0/evaluate.py`, `report.py`, `analyze.py` | `--planner`, the plan variants, the gates of this document | for the oracle: `text_vpa/stage1/evaluate.py` and `report.py` (below) |
+| `scripts/ncp/stage1.sh` | resumable pipeline; smoke mode; never shuts the server down | yes (step 1) |
 
 Tests, each against a reference computed independently: slot and layout assignment against an explicit loop
 over characters; skeleton and codebook; EMA pairing by name; the realizer with a closed gate equals the Stage 0
 realizer token for token; cached keys and values equal recomputed ones; K + 3 depth; the Stage 2 trainer
 rejects `OraclePlan` and `TargetOutput`; the planner's fingerprint is unchanged after Stage 2 steps; an oracle
 run cannot write a report without its label.
+
+## Step 1 as built (21 Nov 2026)
+
+Code: `text_vpa/stage1/` (`slots.py`, `bridge.py`, `plan.py`, `oracle.py`, `data.py`, `train.py`, `evaluate.py`,
+`report.py`, `preflight.py`). Tests: `tests/test_stage1.py`, `tests/test_stage1_cli.py`. Runner:
+`scripts/ncp/stage1.sh`. Stage 0's files changed only where a plan has to pass through them (an optional `plan`
+argument of `Stage0Realizer.canvas_hidden` and `sampler.realize`, hooks in `Stage0Trainer`); without a plan they
+compute what they did, and Stage 0's tests are unchanged and pass.
+
+    SMOKE=1 bash scripts/ncp/stage1.sh     # the pipeline in miniature: server, memory setting, speed
+    bash scripts/ncp/stage1.sh             # preflight, 5,000 steps from runs/stage0-a/last.pt, evaluation, report
+    bash scripts/ncp/stage1.sh status
+
+| step of the script | output |
+|---|---|
+| preflight (`text_vpa.stage1.preflight`) | `RUN/preflight.json`: token offsets, line counts, indentation, MBPP's references as the oracle reads them, skeleton coverage; `RUN/skeleton_codebook.json` |
+| training (`text_vpa.stage1.train --init runs/stage0-a/last.pt`) | `RUN/last.pt`, `RUN/metrics.jsonl`, `RUN/ORACLE.md` |
+| evaluation (`text_vpa.stage1.evaluate`), MBPP validation, 5 samples | `RUN/sweep/mbpp/<tag>/`: `oracle-K{8,32,128}` (the gate's row is K = 8), `oracle-K256-left_to_right`, `oracle-K*-confidence`, `null-K*`, `null-K256-left_to_right` |
+| report (`text_vpa.stage1.report --reference runs/stage0-a/sweep`) | `RUN/sweep/report.md`: the table, the gate after step 1, the delivery check |
+
+**What is the same as Stage 0** (so that the plan is the only change): the trainer's loop, the training states
+(the init run's `prefix_fraction` = 0.5), the loss, AdamW with Stage 0's schedule (500 warm-up steps, cosine from
+2e-4 to 2e-5 at step 5,000), 32 examples per step, the prompts, the token draw, the truncation, the seeds. Step 0
+is the Stage 0 checkpoint exactly: with closed gates the realizer with a plan equals the realizer without one bit
+for bit (tested), so the evaluation at step 0 must repeat the last evaluation of `runs/stage0-a`
+(`stage1.sh status` prints the two side by side).
+
+### Choices made while building it (the design was silent or wrong)
+
+1. **MBPP's references are normalised before the oracle reads them.** Of the 90 validation references, 30 are
+   indented in multiples of four spaces; 13 use tabs, the rest one, two or three spaces; 55 have trailing blanks.
+   Read as written, two thirds of the oracle's plans would carry wrong depths (indentation // 4) and a token
+   layout of a formatting the realizer was not trained to write, and the "upper bound" would be too low. The
+   oracle reads `ast.unparse` of the reference's syntax tree instead: the same program in four-space formatting.
+   Checked on the benchmark file: all 90 parse, all 90 still pass their tests, none has more than 23 lines.
+   Training plans are read from the corpus text as it is.
+2. **The bridge's queries know their canvas position.** Q = H W_Q + P W_P, with P the fixed sinusoidal code of
+   the canvas index (64 wide). Eq. 10 has no such term; the paper's realizer has learned positions. Gemma 4 has
+   rotary attention only, so a hidden state does not hold its canvas index in a form a content query can match
+   against a slot's (start, length), and a slot plan helps a position only if it can find its own slot.
+   `query_position=false` is Eq. 10 as written.
+3. **The layout code** of a slot is the sinusoidal code of start, of length and of end = start + length (wavelengths
+   2 to 1,024 tokens): a linear map of the codes of start and length cannot form the end, and "position i lies in
+   slot m" is start <= i < end.
+4. **Kinds** are 27 lexical classes read from a line's own characters (20 statement keywords with `from` as an
+   import; blank, comment, decorator, string, close, assign, call, other), so they exist for continuation lines
+   and for broken samples; tested against Python's own tokenizer on standard-library modules. A tab counts as four
+   columns of indentation.
+5. **The oracle's plan has no mode row.** A skeleton is a function of the kinds and depths its slots already
+   hold. The bridge has the e(u) row for the method (`num_modes` > 0, tested).
+6. **Start of the run.** The realizer's adapters are `runs/stage0-a`'s and keep training; the bridge (32.8M
+   parameters on E2B) and the oracle's embeddings are new and use the same learning rate; the optimizer is new;
+   the corpus stream continues where `runs/stage0-a` stopped (functions its adapters have not seen).
+7. **In the bridge**: a LayerNorm on the residual stream, 8 heads of 32, spectral norm on W_K and W_V only, keys
+   and values in float32. It enters each block by wrapping two of its frozen norms (`bridge.py` says how); a test
+   compares the result with a Gemma 4 block written out by hand.
+8. **The oracle's rows have their own evaluator and report** (`text_vpa.stage1.evaluate`, `report`); Stage 0's
+   `evaluate` and `train` refuse a `stage1-oracle` checkpoint, so an oracle number cannot appear under a Stage 0
+   tag. MBPP only: the oracle reads a whole reference program.
+
+### Reading the oracle (fixed on 21 Nov 2026, before any run)
+
+The gate is the one above. Three checks decide whether its number can be read:
+
+1. **Step 0 equals `runs/stage0-a`.** Held-out losses and the K = 8 probe at step 0 against that run's last
+   evaluation. A difference is a bug; stop.
+2. **Delivery.** At one token per step (`oracle-K256-left_to_right`) the samples must follow their plans: the
+   mean share of lines that have the planned kind (`kind_match`; a missing or extra line counts as a miss) is at
+   least 0.9. Parallel decisions play no part there, so a lower value means the structure did not reach the
+   realizer (the bridge, or 5,000 steps at this learning rate), and then a ratio under 0.5 at the gate is **not**
+   read as "structure is not enough": the two lower bands wait until that is repaired. A ratio of at least 0.5
+   needs no such check. The null plan's `kind_match` on the same row is printed next to it.
+3. **The plan's effect is read within the same weights.** The oracle run has 5,000 more adapter steps than
+   `runs/stage0-a`; `null-K*` (the null plan) is the comparison that holds the weights fixed, with the caveat
+   this document already names: a model trained to lean on a plan is weaker without it.
+
+While it trains, `plan_gain_k0` (null minus oracle loss with every token masked, nats per masked token) and the
+probe's `kind_match` say whether the plan is being used; both should be clearly above zero by step 1,000 to
+2,000. If they are still rising at step 5,000, the result is budget-limited, and the remedy is a longer run from
+the start (a resumed run continues at the floor learning rate, which is too low for new modules).
+
+### What step 1 cannot tell
+
+- It is an upper bound on *structural* plans, and a loose one for the method: the oracle's layout (the number of
+  tokens of every line) is more than a mode carries. A skeleton holds kinds and depths of at most 16 lines and no
+  lengths; in the method the layout has to come out of g_phi, a deterministic prediction given (c, u). A ratio of
+  at least 0.5 here says the planner is worth building, not that it will pass.
+- One seed, 90 problems: at the gate's thresholds the interval will be wide (Stage 0's rho_1 was 0.69 with
+  [0.45, 0.97]).
+- Not verified off the server: the real tokenizer's character offsets (the preflight checks them against decoded
+  prefixes and stops the run if they disagree), memory and speed with the bridge (the smoke run measures both).

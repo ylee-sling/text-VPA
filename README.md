@@ -360,6 +360,20 @@ bash scripts/ncp/stage0.sh             # the run: baseline, training, K = 2, 4, 
 bash scripts/ncp/stage0.sh status
 ```
 
+### Stage 1: a planner on the Stage 0 realizer
+
+H2 failed for the plan-free realizer (at most 0.4% Pass@1 at K = 8 on MBPP validation against the backbone's
+23.8%), so the next stage asks whether a plan lets it decide many tokens in one pass. Design, gates and recorded
+choices: [`docs/stage1.md`](docs/stage1.md). Built so far is its first step, the *structure oracle*: a diagnostic
+that tells the realizer the reference program's line structure through a gated cross-attention bridge. It is
+never the method, and everything it writes is labelled "oracle: not the method".
+
+```bash
+SMOKE=1 bash scripts/ncp/stage1.sh     # the pipeline in miniature: server, memory setting, speed
+bash scripts/ncp/stage1.sh             # preflight, 5,000 steps from runs/stage0-a, MBPP validation, report
+bash scripts/ncp/stage1.sh status
+```
+
 ## Evaluation (Pass@k)
 
 ```bash

@@ -26,7 +26,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -71,12 +71,16 @@ def autocast(device: torch.device) -> Any:
 def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks: Sequence[EvalTask],
                      benchmark: str, cfg: SamplerConfig, canvas_len: int, num_samples: int, batch_size: int,
                      seed: int, device: torch.device, progress: bool = False, mode: str = "bidirectional",
-                     adapters: bool = True) -> tuple[list[list[str]], dict]:
+                     adapters: bool = True, plan_for: Callable[[int, EvalTask], Any] | None = None
+                     ) -> tuple[list[list[str]], dict]:
     """``num_samples`` canvases per task, decoded up to their first <eos>.
 
     ``mode`` and ``adapters``: the canvas masks and whether LoRA and modulation act (``causal`` without adapters
     is the backbone's own decoding through this code path). A left-to-right row stops at its <eos>, or once the
     truncation rule has found its stop in the revealed prefix; neither changes the program.
+
+    ``plan_for`` (the planner stage): (task index, task) -> a one-row ``PlanCache``, built once per task and
+    shared by all of its samples; prompts, seeds and the token draw are the same with and without it.
     """
     texts: list[list[str]] = []
     forbidden = [tokenizer.pad_id, tokenizer.bos_id]
@@ -98,13 +102,15 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
         start = time.perf_counter()
         with autocast(device):
             cache = realizer.prefill(*left_pad([ids[:-1]], tokenizer.pad_id, device))
+            plan = plan_for(index, task) if plan_for is not None else None
             rows: list[str] = []
             while len(rows) < num_samples:
                 n = min(batch_size, num_samples - len(rows))
                 anchor = torch.full((n,), ids[-1], dtype=torch.long, device=device)
                 result = realize(realizer, cache.expand(n), anchor, canvas_len, cfg, forbidden, generator,
                                  mode=mode, stop_id=stop_id, adapters=adapters,
-                                 row_done=row_done if stop_id is not None else None)
+                                 row_done=row_done if stop_id is not None else None,
+                                 **({} if plan is None else {"plan": plan.expand(n)}))
                 depth = max(depth, result.sequential_depth)
                 row_passes += int(result.row_passes.sum())
                 for step, count in enumerate(result.revealed):
@@ -284,6 +290,10 @@ def main(argv: list[str] | None = None) -> int:
         configs.append(("ar-chat" if args.chat else "ar", None))
     else:
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if ckpt.get("stage", "stage0") != "stage0":
+            # A planner-stage checkpoint also holds a bridge and, for the oracles, a label its results must carry.
+            raise SystemExit(f"{args.checkpoint} is a {ckpt['stage']!r} checkpoint: evaluate it with "
+                             "text_vpa.stage1.evaluate")
         tokenizer = HFTokenizer(hf_tokenizer)
         spec = RealizerSpec.from_dict(ckpt["spec"])
         if spec.mask_id != tokenizer.mask_id:
