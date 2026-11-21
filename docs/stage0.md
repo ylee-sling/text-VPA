@@ -321,6 +321,71 @@ How the result is read, fixed before the run:
    (8.0% against 8.9%). If it differs from the gate's row by more than 4 points here, the network has started to
    use its time input, both rows are reported, and what the sampler feeds above K = 8 becomes a decision.
 
+### Result of the second run (20 to 21 Nov 2026, `runs/stage0-a`)
+
+10,000 steps in 13.8 h (0.202 steps/s), then the sweep on MBPP's validation split (90 problems, 5 samples). The
+first run's value for the same configuration is in parentheses.
+
+| decoder | Pass@1 | parses | mean depth |
+|---|---|---|---|
+| baseline, released model's `generate` | 23.8% | 87.1% | 120 |
+| code check (adapters off, causal, one token per step) | 24.7% | 89.8% | 118 |
+| realizer, left to right, K = 256 (one token per step) | 17.1% (8.9) | 98.2% (58.7) | 49 |
+| realizer, left to right, K = 256, (t, h) as in training | 18.4% (8.0) | 98.2% (59.3) | 48 |
+| realizer, left to right, K = 128 | 17.1% (7.6) | 88.0% (44.2) | 42 |
+| realizer, confidence, K = 128 | 9.8% (4.9) | 71.1% (36.2) | 129 |
+| realizer, exact kernel, K = 128 | 0.7% (0.7) | 17.6% (20.7) | 129 |
+| realizer, confidence, K = 32 | 2.0% (0.0) | 13.8% (5.1) | 33 |
+| realizer, left to right, K = 32 | 1.6% (0.0) | 8.2% (3.1) | 15 |
+| realizer, exact kernel, K = 32 | 1.1% (0.9) | 14.9% (16.7) | 33 |
+| realizer, exact kernel, K = 32, (t, h) as in training | 1.3% (0.7) | 15.6% (16.0) | 33 |
+| realizer, exact kernel, K = 8 | 0.4% (0.2) | 7.1% (6.9) | 9 |
+| realizer, confidence, K = 8 | 0.0% (0.0) | 1.3% (1.3) | 9 |
+| realizer, left to right, K = 8 | 0.0% (0.0) | 3.1% (0.0) | 5 |
+
+**Gate: rho_1 = 0.694 [0.450, 0.965], partial.** H2's pair on this split, for reference: 0.019 [0.000, 0.048].
+The K = 8 probe during training: 0.0, 0.0, 0.0, 0.2, 0.4% at steps 0 to 10,000. Held-out next-token loss: 5.179
+at step 0, then 1.010, 0.967, 0.960, 0.933 (first run at the same steps: 1.028, 1.075, 1.066, 1.071; backbone
+1.187).
+
+Read by the rules fixed before the run:
+
+1. **Def lines: the fix worked.** 0.0% bad and 0.0% copied at K = 256 and K = 128, like the backbone. At
+   K = 8 (left to right) 7.1% of the `def` lines are not Python and none is a copy: parallel decisions, not the
+   flaw.
+2. **The gate is partial, and its interval spans both thresholds:** 90 problems cannot tell 0.6 from 0.9. What is
+   left of the gap is not syntax. At one token per step the realizer's samples are 17.1% passed, 1.8% syntax
+   errors, 58.4% wrong answers, 22.7% runtime errors (code check: 24.7 / 10.2 / 48.2 / 16.9). Paired over the 90
+   problems: both solve 17, only the code check 17, only the realizer 2, neither 54; the first run also failed
+   13 of those 17. Two causes are visible in the samples:
+   - *Argument count.* 58 of the realizer's 450 samples fail on a call with the wrong number of arguments
+     (12.9%; the code check 29, 6.4%; the first run 39 of its 277 samples with a valid `def` line, 14%). MBPP
+     often shows a parameter only in the test's arguments, and the realizer of either run does not read the
+     count from them. The new assert line neither caused this nor cured it. If the 29 extra failures passed at
+     the rate of the realizer's other samples, rho_1 would be about 0.75.
+   - *Shorter, simpler programs.* 4.8 lines on average against the code check's 12.2, with plain logic errors
+     (`return string.upper() if string.lower() else string.lower()` for a case toggle). The adapters moved the
+     model toward the corpus's short functions.
+
+   Neither cause is about the shape of the training masks.
+3. **Fewer steps: unchanged in kind.** The exact kernel at K = 128, two tokens per step at random positions,
+   stays at 0.7% in both runs while left to right at the same K reaches 17.1%: generation in random order is
+   broken whatever the number of steps, and what breaks it is deciding tokens far from known context. The
+   confidence order improved (9.8% at K = 128, 2.0% at K = 32) and still fails by a factor of ten at K = 32.
+   Contiguous blocks of 4 to 6 tokens collapse (left to right at K = 32: 1.6%). At K = 8 nothing exceeds 0.4%.
+4. **Control:** 18.4% against 17.1% with (t, h) as in training, 1.3 points, under the 4 points fixed beforehand.
+   The time input is still unused.
+
+What cannot be said: how much of the gain at one token per step belongs to the data fix and how much to the
+prefix-shaped states (two changes, one run). The next-token curve is below the first run's at every step, but
+the first run's model was scored on prompts in the new format. And the realizer's depth of 49 against the
+baseline's 120 is the stopping rule (its own `<eos>` against the truncation rule's look-ahead), not the method.
+
+**Decisions of 21 Nov (the author's):** `runs/stage0-a` is the Stage 0 decoder. No distillation for now, although
+the paper's Stage 2 names it (Sec. 5.1: "distillation from a 1,024-step teacher"); it stays available as an
+ablation. Next: the planner on top of this realizer, `docs/stage1.md`. The argument count is not fixed in that
+stage, so that the plan is its only change.
+
 ## Reading the result
 
 - `python -m text_vpa.stage0.analyze --eval RUN/eval --mbpp data2/eval/mbpp.jsonl` sorts every sample into
