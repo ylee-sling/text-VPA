@@ -3,11 +3,12 @@
 Written on 21 Nov 2026, after the second Stage 0 run. It fixes the order of experiments, their gates and the open
 choices before any of them exists, in the way `docs/stage0.md` did for Stage 0.
 
-**Status (22 Nov 2026, 11:00).** The author confirmed the design's three open choices on 21 Nov: slots are
+**Status (22 Nov 2026, 15:00).** The author confirmed the design's three open choices on 21 Nov: slots are
 lines, modes are line skeletons, the bridge has no s_x rows. Step 1, the structure oracle, ran on 21 to 22 Nov
 (`runs/stage1-oracle`, finished 10:38 KST): **clearly under 0.1** (rho = 0.000 [0.000, 0.000]; "Step 1: result"
-below). It also answers steps 3 and 4 as designed (same section). Step 2, the latent oracle, is built and has not
-run; its reading rule was revised on 22 Nov before the run ("Step 2 as built"). Steps 3 and 4 are not built.
+below). It also answers steps 3 and 4 as designed (same section). Step 2, the latent oracle, **is running** since
+22 Nov, about 14:55 KST (`runs/stage1-latent`, commit `c226d2f`, `TRAIN_ADAPTERS` = 1); its gate and its revised
+reading rule were confirmed by the author before the run ("Step 2 as built"). Steps 3 and 4 are not built.
 
 ## The question
 
@@ -351,9 +352,9 @@ the start (a resumed run continues at the floor learning rate, which is too low 
 - **Within the same weights the plan changes nothing at parallel K and costs Pass@1 at one token per step:** -6.4
   points [-12.9, -0.2] (parses 97.6% to 77.1%). A layout the realizer trusts (another function's plan: 12.7 nats)
   pushes it into the reference's form, which it then fills with its own content.
-- **The extra training cost a little without a plan:** null plan 13.8% against `runs/stage0-a`'s 17.1% at one token
-  per step (its interval is computed by the `TRAIN_ADAPTERS` check of step 2). It includes the known confound: a
-  model trained to lean on a plan is weaker without one.
+- **The extra training cost a little without a plan, within noise:** null plan 13.8% against `runs/stage0-a`'s
+  17.1% at one token per step, difference -3.3 points [-8.7, +1.8] (95% paired bootstrap over the 90 problems). It
+  includes the known confound: a model trained to lean on a plan is weaker without one.
 - **Confidence order collapses with the plan:** 0.0 / 0.0 / 0.2% at K = 8 / 32 / 128, against `runs/stage0-a`'s
   0.0 / 2.0 / 9.8% (no null-plan row in this order). A likely explanation, not tested: with the layout known the
   realizer is confident about structural tokens all over the canvas, so confidence order stops growing a prefix.
@@ -417,11 +418,14 @@ settled step 1); the share of samples reproducing the reference and the kind mat
 held-out loss against the structure oracle's and against the plan-free realizer's next-token loss with the full left
 context (this run's step 0, 0.933; the all-masked mean includes the <eos> filling at weight 0.1).
 
+The gate and this reading rule were **confirmed by the author on 22 Nov 2026, before the run.**
+
 **Realizer adapters** (`TRAIN_ADAPTERS`): 1 trains them as in step 1 (one change between the two steps, and the plan
 gets the best chance: an upper bound). 0 keeps them at `runs/stage0-a`'s values, so that "no plan" is exactly the
 Stage 0 realizer. Rule fixed now: keep 1, unless the step-1 null-plan row at one token per step is below
 `runs/stage0-a`'s 17.1% with its 95% paired-bootstrap interval of the difference entirely below zero (the extra
-training itself degraded the realizer); then 0.
+training itself degraded the realizer); then 0. **Applied at launch:** -3.3 points [-8.7, +1.8] on 90 problems; the
+interval includes zero, so `TRAIN_ADAPTERS` = 1.
 
     SMOKE=1 PLAN=oracle-latent bash scripts/ncp/stage1.sh        # runs/stage1-latent-smoke: memory and speed
     PLAN=oracle-latent bash scripts/ncp/stage1.sh                # runs/stage1-latent; TRAIN_ADAPTERS=0 to freeze
