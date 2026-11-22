@@ -125,3 +125,27 @@ def test_stage1_oracle_pipeline(tmp_path, capsys):
     text = (sweep / "report.md").read_text()
     assert text.startswith("# Text-VPA Stage 1, step 1: the structure oracle (oracle: not the method)")
     assert text.count(ORACLE_LABEL) >= 8 and "## Gate after step 1" in text
+
+    # Step 2, the latent oracle, with the realizer's adapters frozen: train, resume, evaluate, report.
+    latent = tmp_path / "latent"
+    latent_args = [*data, "--run", str(latent), "--device", "cpu"]
+    assert train.main([*latent_args, "--init", str(stage0 / "last.pt"), "--set", *small, "plan=oracle-latent",
+                       "latent_layers=2", "train_adapters=false"]) == 0
+    assert train.main([*latent_args, "--steps", "6"]) == 0
+    trained = torch.load(latent / "last.pt", weights_only=True)
+    assert trained["plan"] == "oracle-latent" and trained["step"] == 6 and trained["label"] == ORACLE_LABEL
+    for name, value in start["trainable"].items():
+        assert torch.equal(trained["trainable"][name], value), name      # frozen adapters: the Stage 0 values
+    assert json.loads((latent / "config.json").read_text())["trainable_parameters"]["realizer_adapters"] == 0
+    assert "states of the reference program's lines" in (latent / "ORACLE.md").read_text()
+    latent_sweep = latent / "sweep"
+    assert evaluate.main(["--checkpoint", str(latent / "last.pt"), "--model", str(model), "--eval-dir", str(bench),
+                          "--out", str(latent_sweep), "--num-samples", "2", "--device", "cpu", "--exec-workers", "1",
+                          "--plans", "oracle", "null", "--k-steps", "8"]) == 0
+    row = json.loads((latent_sweep / "mbpp" / "oracle-K8" / "summary.json").read_text())
+    assert row["oracle"] == "latent" and row["label"] == ORACLE_LABEL and "reproduced" in row
+    assert report.main(["--eval", str(latent_sweep), "--run", str(latent), "--reference", str(reference),
+                        "--structure-run", str(run)]) == 0
+    latent_report = json.loads((latent_sweep / "report.json").read_text())
+    assert latent_report["oracle"] == "latent" and latent_report["carried"]["structure_loss"] is not None
+    assert (latent_sweep / "report.md").read_text().startswith("# Text-VPA Stage 1, step 2: the latent oracle")

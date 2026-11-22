@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 """
-train.py -- the structure oracle (docs/stage1.md, step 1): the Stage 0 realizer plus the bridge, trained on the
-reference's true line structure. A diagnostic. It is never the method, and everything it writes says so.
+train.py -- the oracles of docs/stage1.md: the Stage 0 realizer plus the bridge, trained on a plan read from the
+reference. ``plan=oracle-structure`` (step 1): the reference's true line structure; ``plan=oracle-latent``
+(step 2): the frozen backbone's states of the reference's lines (``oracle.py``). Diagnostics. They are never the
+method, and everything they write says so.
 
     python -m text_vpa.stage1.train --init runs/stage0-a/last.pt --corpus data2/corpus --eval-dir data2/eval \\
-        --run runs/stage1-oracle
+        --run runs/stage1-oracle                                     # step 1
+    python -m text_vpa.stage1.train --init runs/stage0-a/last.pt --corpus data2/corpus --eval-dir data2/eval \\
+        --run runs/stage1-latent --set plan=oracle-latent            # step 2
+
+``train_adapters=false`` keeps the realizer's own trained parts (LoRA, mask embedding, modulation) at the init
+checkpoint's values: only the bridge and the oracle train, so the run's "no plan" reference is the init
+checkpoint itself and not a realizer trained further.
 
 What is the same as Stage 0, so that the plan is the only change: the loop (``Stage0Trainer``), the training
 states (mask-source path, the init run's ``prefix_fraction``), the loss, AdamW and its schedule (warm-up, cosine
@@ -49,7 +57,7 @@ from text_vpa.stage0.sampler import SamplerConfig
 from text_vpa.stage0.train import Stage0Config, Stage0Trainer, _overrides
 from text_vpa.stage1.bridge import BridgeSpec, PlanBridge, PlanCache
 from text_vpa.stage1.data import PlanCorpusStream, PlanExample, collate_plan, load_plan_validation
-from text_vpa.stage1.oracle import PLAN_VARIANTS, StructureOracle, oracle_samples
+from text_vpa.stage1.oracle import ORACLE_KINDS, PLAN_VARIANTS, LatentOracle, StructureOracle, oracle_samples
 from text_vpa.stage1.plan import ORACLE_LABEL, require_oracle_plan
 from text_vpa.stage1.slots import KINDS, LineSlots
 from text_vpa.utils.device import resolve_device
@@ -69,7 +77,7 @@ RECIPE: tuple[str, ...] = (
 
 @dataclass
 class Stage1Config(Stage0Config):
-    """A structure-oracle run: Stage 0's fields (recipe values come from the init checkpoint) and the plan's."""
+    """An oracle run: Stage 0's fields (recipe values come from the init checkpoint) and the plan's."""
 
     steps: int = 5_000
     schedule_steps: int = 5_000
@@ -85,6 +93,8 @@ class Stage1Config(Stage0Config):
     gamma: float = 1.0
     spectral_norm: bool = True
     query_position: bool = True
+    latent_layers: int = 15                # the latent oracle reads the reference through blocks 0 .. 14
+    train_adapters: bool = True            # False: the realizer's own parts stay at the init checkpoint
 
     def bridge_spec(self) -> BridgeSpec:
         return BridgeSpec(latent_dim=self.latent_dim, width=self.bridge_width, num_heads=self.bridge_heads,
@@ -93,25 +103,29 @@ class Stage1Config(Stage0Config):
                           query_position=self.query_position)
 
 
-def build_plan_modules(cfg: Stage1Config, realizer: Stage0Realizer) -> tuple[PlanBridge, StructureOracle]:
-    """The bridge (attached to ``realizer``) and the oracle's embeddings, initialised from ``cfg.seed``."""
-    if cfg.plan != "oracle-structure":
-        raise ValueError(f"unknown plan {cfg.plan!r}: this trainer builds the structure oracle only")
+def build_plan_modules(cfg: Stage1Config, realizer: Stage0Realizer
+                       ) -> tuple[PlanBridge, StructureOracle | LatentOracle]:
+    """The bridge (attached to ``realizer``) and the oracle's modules, initialised from ``cfg.seed``."""
+    if cfg.plan not in ORACLE_KINDS:
+        raise ValueError(f"unknown plan {cfg.plan!r}: this trainer builds {sorted(ORACLE_KINDS)}")
+    if cfg.plan == "oracle-latent" and not 1 <= cfg.latent_layers <= realizer.num_kv_layers:
+        raise ValueError(f"latent_layers must be in 1 .. {realizer.num_kv_layers} (the KV-storing blocks)")
     generator_state = torch.random.get_rng_state()
     torch.manual_seed(cfg.seed)
     bridge = PlanBridge(cfg.bridge_spec(), realizer.hidden_size, realizer.num_layers)
-    oracle = StructureOracle(cfg.latent_dim)
+    oracle: StructureOracle | LatentOracle = (LatentOracle(realizer.hidden_size, cfg.latent_dim)
+                                              if cfg.plan == "oracle-latent" else StructureOracle(cfg.latent_dim))
     torch.random.set_rng_state(generator_state)
     bridge.attach(realizer)
     return bridge, oracle
 
 
 class OracleTrainer(Stage0Trainer):
-    """``Stage0Trainer`` with the structure oracle's plan on every canvas pass."""
+    """``Stage0Trainer`` with an oracle's plan on every canvas pass."""
 
     stage = STAGE
 
-    def __init__(self, realizer: Stage0Realizer, bridge: PlanBridge, oracle: StructureOracle,
+    def __init__(self, realizer: Stage0Realizer, bridge: PlanBridge, oracle: StructureOracle | LatentOracle,
                  tokenizer: Stage0Tokenizer, cfg: Stage1Config, stream: PlanCorpusStream,
                  validation: Sequence[PlanExample], run_dir: str | Path, device: torch.device,
                  probe_tasks: Sequence[Any] = (), logger: MetricLogger | None = None,
@@ -124,7 +138,8 @@ class OracleTrainer(Stage0Trainer):
 
     # -- Stage 0's hooks -----------------------------------------------------------------------
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
-        return [*self.realizer.trainable_parameters(), *self.bridge.parameters(), *self.oracle.parameters()]
+        own = self.realizer.trainable_parameters() if self.cfg.train_adapters else []
+        return [*own, *self.bridge.parameters(), *self.oracle.parameters()]
 
     def set_training(self, mode: bool) -> None:
         self.realizer.train(mode)
@@ -134,23 +149,34 @@ class OracleTrainer(Stage0Trainer):
     def collate(self, examples: Sequence[PlanExample]) -> Batch:
         return collate_plan(examples, self.cfg.canvas_len, self.tokenizer.eos_id, self.cfg.max_slots)
 
-    def plan_cache(self, batch: Batch) -> PlanCache:
+    def plan_cache(self, batch: Batch, cache: Any) -> PlanCache:
         """Keys and values of the batch's plans: the oracle's (with plan dropout in training), the null plan, or
-        each row's neighbour's plan (``self.variant``)."""
+        each row's neighbour's plan (``self.variant``). The latent oracle reads each row's clean program with the
+        frozen backbone after the row's own prompt (``cache``) before the rows are rolled."""
         if self.variant not in PLAN_VARIANTS:
             raise ValueError(f"plan must be one of {PLAN_VARIANTS}")
         slots = batch.slots.to(self.device)
-        if self.variant == "shuffled":
-            slots = slots.roll(1)
-        plan = require_oracle_plan(self.oracle(slots))
-        drop = torch.ones(plan.batch_size, dtype=torch.bool) if self.variant == "null" else None
+        if self.variant == "null":
+            b = slots.kind.shape[0]
+            return self.bridge.project(self.bridge.null_conditioning(b))
+        if isinstance(self.oracle, LatentOracle):
+            canvas = torch.cat([batch.anchor[:, None], batch.target], dim=1).to(self.device)
+            states = self.realizer.frozen_states(cache, canvas, self.cfg.latent_layers)
+            if self.variant == "shuffled":
+                slots, states = slots.roll(1), states.roll(1, dims=0)
+            plan = require_oracle_plan(self.oracle(states, slots))
+        else:
+            if self.variant == "shuffled":
+                slots = slots.roll(1)
+            plan = require_oracle_plan(self.oracle(slots))
+        drop = None
         return self.bridge.project(self.bridge.conditioning(plan.z, plan.mask, drop=drop,
                                                             generator=self.dropout_generator))
 
     def canvas_pass(self, batch: Batch, state: TrainingState, cache: Any, mode: str, adapters: bool
                     ) -> torch.Tensor:
         dev = self.device
-        plan = self.plan_cache(batch) if adapters else None      # adapters off: the frozen backbone, no plan
+        plan = self.plan_cache(batch, cache) if adapters else None    # adapters off: the frozen backbone
         return self.realizer.canvas_hidden(
             cache, state.canvas_ids.to(dev), state.is_mask.to(dev), state.t.to(dev), state.h.to(dev),
             mode=mode, adapters=adapters, checkpointing=self.cfg.grad_checkpoint and torch.is_grad_enabled(),
@@ -172,7 +198,16 @@ class OracleTrainer(Stage0Trainer):
 
     # -- one step ------------------------------------------------------------------------------
     def train_step(self) -> dict[str, float]:
-        out = super().train_step()
+        # train_adapters=False: the realizer's own parts take no gradient during the step (they stay trainable
+        # parameters of the realizer otherwise, so its checkpoint format does not change).
+        frozen = [] if self.cfg.train_adapters else self.realizer.trainable_parameters()
+        for p in frozen:
+            p.requires_grad_(False)
+        try:
+            out = super().train_step()
+        finally:
+            for p in frozen:
+                p.requires_grad_(True)
         gates = self.bridge.gates().detach().abs()
         return {**out, "gate_mean": float(gates.mean()), "gate_max": float(gates.max())}
 
@@ -225,11 +260,12 @@ class OracleTrainer(Stage0Trainer):
         sampler = SamplerConfig(num_steps=cfg.probe_steps, schedule=cfg.schedule)
         texts, info, _ = oracle_samples(self.realizer, self.bridge, self.oracle, self.tokenizer, self.probe_tasks,
                                         "mbpp", sampler, cfg.canvas_len, cfg.probe_samples, cfg.probe_samples,
-                                        seed=7, device=self.device, max_slots=cfg.max_slots)
+                                        seed=7, device=self.device, max_slots=cfg.max_slots,
+                                        latent_layers=cfg.latent_layers)
         summary, _ = score(self.probe_tasks, "mbpp", texts, [1])
         self.set_training(True)
         return {"probe_pass@1": summary["pass@1"], "probe_parse_rate": summary["parse_rate"],
-                "probe_kind_match": info["kind_match"]}
+                "probe_kind_match": info["kind_match"], "probe_reproduced": info["reproduced"]}
 
     # -- memory --------------------------------------------------------------------------------
     def worst_case_batch(self, micro_batch: int) -> Batch:
@@ -253,11 +289,11 @@ class OracleTrainer(Stage0Trainer):
 
 
 def load_oracle_run(payload: dict[str, Any], model: Any, tokenizer: Stage0Tokenizer
-                    ) -> tuple[Stage0Realizer, PlanBridge, StructureOracle, Stage1Config]:
+                    ) -> tuple[Stage0Realizer, PlanBridge, StructureOracle | LatentOracle, Stage1Config]:
     """Rebuild the realizer, the bridge and the oracle of a ``stage1-oracle`` checkpoint on a loaded Gemma 4
     (on the CPU, eval mode)."""
     if payload.get("stage") != STAGE or payload.get("label") != ORACLE_LABEL:
-        raise ValueError("not a structure-oracle checkpoint (stage or label is missing)")
+        raise ValueError("not an oracle checkpoint (stage or label is missing)")
     if payload.get("kinds") != list(KINDS):
         raise ValueError("the checkpoint was trained with another list of line kinds")
     cfg = Stage1Config.from_dict(payload["config"])
@@ -276,7 +312,7 @@ def load_oracle_run(payload: dict[str, Any], model: Any, tokenizer: Stage0Tokeni
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Stage 1, step 1: train the structure oracle (a diagnostic)",
+    p = argparse.ArgumentParser(description="Stage 1, steps 1 and 2: train an oracle (a diagnostic)",
                                 epilog=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--init", type=Path, default=None, help="the Stage 0 checkpoint to start from (a new run)")
     p.add_argument("--corpus", type=Path, required=True, help="corpus directory (train-*.jsonl.gz, val.jsonl.gz)")
@@ -299,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     payload = load_checkpoint(last) if last.exists() else None
     if payload is not None:
         if payload.get("stage") != STAGE:
-            raise SystemExit(f"{last} is a {payload.get('stage')!r} checkpoint, not a structure-oracle run")
+            raise SystemExit(f"{last} is a {payload.get('stage')!r} checkpoint, not an oracle run")
         cfg = Stage1Config.from_dict(payload["config"])
         start = payload
         if args.set or args.init:
@@ -351,19 +387,23 @@ def main(argv: list[str] | None = None) -> int:
         report = trainer.fit_memory()
         (args.run / "memory.json").write_text(json.dumps(report, indent=2))
         print(f"memory check: {json.dumps(report)}", file=sys.stderr)
-    counts = {"realizer_adapters": sum(p.numel() for p in realizer.trainable_parameters()),
+    counts = {"realizer_adapters": sum(p.numel() for p in realizer.trainable_parameters()) if cfg.train_adapters else 0,
               "bridge": sum(p.numel() for p in bridge.parameters()),
               "oracle": sum(p.numel() for p in oracle.parameters())}
+    kind = ORACLE_KINDS[cfg.plan]
+    what = {"structure": "the line structure of the reference program (docs/stage1.md, step 1)",
+            "latent": "the frozen backbone's states of the reference program's lines (docs/stage1.md, step 2)"}[kind]
     (args.run / "config.json").write_text(json.dumps(
         {**cfg.to_dict(), "stage": STAGE, "label": ORACLE_LABEL, "init_checkpoint": init,
          "trainable_parameters": counts, "mask_id": tokenizer.mask_id}, indent=2))
     (args.run / "ORACLE.md").write_text(
-        f"# {ORACLE_LABEL}\n\nThis run conditions the realizer on the line structure of the reference program "
-        "(docs/stage1.md, step 1).\nIt is a diagnostic. No number of it is a result of the method.\n")
-    print(f"Stage 1 structure oracle ({ORACLE_LABEL}): "
+        f"# {ORACLE_LABEL}\n\nThis run conditions the realizer on {what}.\nIt is a diagnostic. No number of it is a "
+        "result of the method.\n")
+    print(f"Stage 1 {kind} oracle ({ORACLE_LABEL}): "
           + ", ".join(f"{name} {count / 1e6:.1f}M" for name, count in counts.items())
-          + f" trainable parameters, steps {trainer.step} -> {cfg.steps}, {cfg.micro_batch} x {cfg.grad_accum} "
-          f"examples per step, from {init['path']} (step {init['step']})", file=sys.stderr)
+          + f" trainable parameters{'' if cfg.train_adapters else ' (realizer adapters frozen)'}, steps "
+          f"{trainer.step} -> {cfg.steps}, {cfg.micro_batch} x {cfg.grad_accum} examples per step, from "
+          f"{init['path']} (step {init['step']})", file=sys.stderr)
     trainer.fit()
     return 0
 

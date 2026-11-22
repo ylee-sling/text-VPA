@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 #
-# stage1.sh -- step 1 of the planner stage (docs/stage1.md) on the NCP server (one NVIDIA L4), resumable at every
-# step: the STRUCTURE ORACLE. It is a diagnostic ("oracle: not the method"): the realizer is told the reference
-# program's line structure. Nothing of it is a result of the method, and nothing touches a test set.
+# stage1.sh -- the oracles of the planner stage (docs/stage1.md) on the NCP server (one NVIDIA L4), resumable at
+# every step. PLAN=oracle-structure (step 1, the default): the realizer is told the reference program's line
+# structure. PLAN=oracle-latent (step 2): it is told the frozen backbone's states of the reference's lines. Both are
+# diagnostics ("oracle: not the method"). Nothing of them is a result of the method, and nothing touches a test set.
+#
+#   PLAN=oracle-latent bash scripts/ncp/stage1.sh            step 2 into runs/stage1-latent
+#   PLAN=oracle-latent TRAIN_ADAPTERS=0 bash scripts/ncp/stage1.sh   the same with the realizer's adapters frozen
 #
 #   checks -> preflight -> oracle training from the Stage 0 checkpoint -> evaluation on MBPP validation -> report
 #
@@ -39,7 +43,10 @@
 # security sandbox: they run as this user.
 #
 # Variables (defaults in brackets):
-#   RUN          [runs/stage1-oracle]   checkpoints, metrics, evaluation results, report
+#   PLAN         [oracle-structure]     oracle-structure (step 1) or oracle-latent (step 2)
+#   RUN          [runs/stage1-oracle; latent: runs/stage1-latent; smoke: ...-smoke]   checkpoints, metrics, results
+#   TRAIN_ADAPTERS [1]                  0: the realizer's own parts stay at INIT (only the bridge and oracle train)
+#   STRUCTURE_RUN [latent: runs/stage1-oracle; smoke: none]   the structure oracle's run, read by step 2's gate
 #   INIT         [runs/stage0-a/last.pt] the Stage 0 checkpoint the oracle starts from (its recipe is kept)
 #   REFERENCE    [runs/stage0-a/sweep]  that checkpoint's sweep: baseline `ar` and the realizer without a plan
 #   DATA         [data2]                DATA/corpus, DATA/eval, DATA/models
@@ -67,17 +74,27 @@ export PYTHONNOUSERSITE=1 TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_TELEMETRY=
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SMOKE="${SMOKE:-0}"
+PLAN="${PLAN:-oracle-structure}"
+case "$PLAN" in
+  oracle-structure) RUN_NAME="stage1-oracle"; STRUCTURE_DEFAULT="" ;;
+  oracle-latent)    RUN_NAME="stage1-latent"; STRUCTURE_DEFAULT="runs/stage1-oracle" ;;
+  *) echo "error: PLAN must be oracle-structure or oracle-latent" >&2; exit 1 ;;
+esac
+TRAIN_ADAPTERS="${TRAIN_ADAPTERS:-1}"
+[[ "$TRAIN_ADAPTERS" == 0 || "$TRAIN_ADAPTERS" == 1 ]] || { echo "error: TRAIN_ADAPTERS must be 0 or 1" >&2; exit 1; }
 if [[ "$SMOKE" == 1 ]]; then
-  RUN="${RUN:-runs/stage1-oracle-smoke}"; STEPS="${STEPS:-30}"; NUM_SAMPLES="${NUM_SAMPLES:-2}"; LIMIT="${LIMIT:-8}"
+  STRUCTURE_DEFAULT=""                             # a smoke run's held-out set is not the structure run's
+  RUN="${RUN:-runs/$RUN_NAME-smoke}"; STEPS="${STEPS:-30}"; NUM_SAMPLES="${NUM_SAMPLES:-2}"; LIMIT="${LIMIT:-8}"
   K_STEPS="${K_STEPS:-8 32}"; CODEBOOK_SAMPLE="${CODEBOOK_SAMPLE:-5000}"
   REFERENCE="${REFERENCE:-}"                       # the smoke run scores its own baseline on its 8 problems
   SMOKE_SET="save_every=15 eval_every=15 log_every=5 warmup_steps=5 val_examples=32 probe_samples=1"
 else
-  RUN="${RUN:-runs/stage1-oracle}"; STEPS="${STEPS:-5000}"; NUM_SAMPLES="${NUM_SAMPLES:-5}"; LIMIT="${LIMIT:-}"
+  RUN="${RUN:-runs/$RUN_NAME}"; STEPS="${STEPS:-5000}"; NUM_SAMPLES="${NUM_SAMPLES:-5}"; LIMIT="${LIMIT:-}"
   K_STEPS="${K_STEPS:-8 32 128}"; CODEBOOK_SAMPLE="${CODEBOOK_SAMPLE:-200000}"
   REFERENCE="${REFERENCE-runs/stage0-a/sweep}"
   SMOKE_SET=""
 fi
+STRUCTURE_RUN="${STRUCTURE_RUN-$STRUCTURE_DEFAULT}"
 INIT="${INIT:-runs/stage0-a/last.pt}"
 DATA="${DATA:-data2}"
 MODEL="${MODEL:-google/gemma-4-E2B}"
@@ -164,8 +181,10 @@ if evals:
               f"{r.get('eval/val_loss_shuffled_k0', float('nan')):.3f}")
 probes = {r["step"]: r for r in rows if "eval/probe_pass@1" in r}
 if probes:
-    print("probe (MBPP validation, K = 8, oracle plan): Pass@1, share of lines with the planned kind")
+    print("probe (MBPP validation, K = 8, oracle plan): Pass@1, share of lines with the planned kind"
+          + (", share reproducing the reference" if any("eval/probe_reproduced" in r for r in probes.values()) else ""))
     print("  " + ", ".join(f"{s}: {100 * r['eval/probe_pass@1']:.1f}% / {r.get('eval/probe_kind_match', 0):.2f}"
+                           + (f" / {100 * r['eval/probe_reproduced']:.1f}%" if "eval/probe_reproduced" in r else "")
                            for s, r in sorted(probes.items())))
 EOF
   fi
@@ -193,11 +212,12 @@ launch() {
     # own, older environment to the new session. REFERENCE may be set and empty (no reference), so it is
     # passed whenever it is set.
     local env_args=() name
-    for name in SMOKE RUN INIT DATA MODEL STEPS TRAIN_SET STAGES K_STEPS NUM_SAMPLES LIMIT CODEBOOK_SAMPLE \
+    for name in SMOKE PLAN TRAIN_ADAPTERS RUN INIT DATA MODEL STEPS TRAIN_SET STAGES K_STEPS NUM_SAMPLES LIMIT \
+                CODEBOOK_SAMPLE \
                 CANVAS_LEN ALLOW_BUSY_GPU SKIP_TESTS REQUIRE_GPU PY HF_TOKEN; do
       if [[ -n "${!name:-}" ]]; then env_args+=(-e "$name=${!name}"); fi
     done
-    env_args+=(-e "REFERENCE=$REFERENCE")
+    env_args+=(-e "REFERENCE=$REFERENCE" -e "STRUCTURE_RUN=$STRUCTURE_RUN")
     tmux new-session -d -s "$SESSION" -c "$ROOT" "${env_args[@]}" \
       "bash scripts/ncp/stage1.sh run 2>&1 | tee -a '$LOG'"
     echo "started in tmux session '$SESSION'   ($LABEL)"
@@ -213,7 +233,7 @@ launch() {
 
 summarize() {
   # shellcheck disable=SC2086
-  "$PY" -m text_vpa.stage1.report --eval "$RUN/sweep" --run "$RUN" $REFERENCE_ARGS >/dev/null
+  "$PY" -m text_vpa.stage1.report --eval "$RUN/sweep" --run "$RUN" $REFERENCE_ARGS $STRUCTURE_ARGS >/dev/null
   "$PY" -m text_vpa.stage0.analyze --eval "$RUN/sweep" --mbpp "$DATA/eval/mbpp.jsonl" >/dev/null
   log "tables updated: $RUN/sweep/report.md, $RUN/sweep/analysis.md"
 }
@@ -221,8 +241,14 @@ summarize() {
 run() {
   mkdir -p "$RUN/done"
   trap 'log "stage 1 stopped with an error (line $LINENO); rerun the same command to continue"' ERR
-  log "Stage 1, structure oracle ($LABEL): RUN=$RUN INIT=$INIT REFERENCE='$REFERENCE' DATA=$DATA STEPS=$STEPS" \
-    "samples=$NUM_SAMPLES K='$K_STEPS' stages='$STAGES' smoke=$SMOKE train_set='$TRAIN_SET'"
+  log "Stage 1, $PLAN ($LABEL): RUN=$RUN INIT=$INIT REFERENCE='$REFERENCE' STRUCTURE_RUN='$STRUCTURE_RUN'" \
+    "DATA=$DATA STEPS=$STEPS samples=$NUM_SAMPLES K='$K_STEPS' stages='$STAGES' smoke=$SMOKE" \
+    "train_adapters=$TRAIN_ADAPTERS train_set='$TRAIN_SET'"
+  STRUCTURE_ARGS=""
+  if [[ "$PLAN" == oracle-latent && -n "$STRUCTURE_RUN" ]]; then
+    [[ -f "$STRUCTURE_RUN/metrics.jsonl" ]] || die "$STRUCTURE_RUN/metrics.jsonl is missing: step 2's gate reads the structure oracle's run"
+    STRUCTURE_ARGS="--structure-run $STRUCTURE_RUN"
+  fi
   [[ -x "$PY" ]] || die "$PY is missing: this script uses the repository's .venv"
   local stage
   read -r -a STAGE_LIST <<< "$STAGES"
@@ -281,13 +307,14 @@ EOF
 
   # ---- 5. training ------------------------------------------------------------------------------
   if ! done_marker "train-$STEPS"; then
-    log "training the structure oracle to step $STEPS"
+    log "training the $PLAN to step $STEPS"
     if [[ -f "$RUN/last.pt" ]]; then
       "$PY" -m text_vpa.stage1.train --corpus "$DATA/corpus" --eval-dir "$DATA/eval" --run "$RUN" --steps "$STEPS"
     else
       # shellcheck disable=SC2086
       "$PY" -m text_vpa.stage1.train --init "$INIT" --corpus "$DATA/corpus" --eval-dir "$DATA/eval" --run "$RUN" \
-        --set "model=$MODEL_DIR" "steps=$STEPS" $SMOKE_SET $TRAIN_SET
+        --set "model=$MODEL_DIR" "steps=$STEPS" "plan=$PLAN" "train_adapters=$([[ $TRAIN_ADAPTERS == 1 ]] && echo true || echo false)" \
+        $SMOKE_SET $TRAIN_SET
     fi
     mark "train-$STEPS"
   fi
@@ -347,8 +374,9 @@ EOF
     esac
     summarize
   done
-  "$PY" -m text_vpa.stage1.report --eval "$RUN/sweep" --run "$RUN" $REFERENCE_ARGS
-  log "stage 1, structure oracle ($LABEL) finished: $RUN/sweep/report.md, $RUN/sweep/analysis.md"
+  # shellcheck disable=SC2086
+  "$PY" -m text_vpa.stage1.report --eval "$RUN/sweep" --run "$RUN" $REFERENCE_ARGS $STRUCTURE_ARGS
+  log "stage 1, $PLAN ($LABEL) finished: $RUN/sweep/report.md, $RUN/sweep/analysis.md"
 }
 
 case "${1:-launch}" in

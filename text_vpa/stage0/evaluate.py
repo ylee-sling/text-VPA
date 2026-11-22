@@ -71,7 +71,7 @@ def autocast(device: torch.device) -> Any:
 def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks: Sequence[EvalTask],
                      benchmark: str, cfg: SamplerConfig, canvas_len: int, num_samples: int, batch_size: int,
                      seed: int, device: torch.device, progress: bool = False, mode: str = "bidirectional",
-                     adapters: bool = True, plan_for: Callable[[int, EvalTask], Any] | None = None
+                     adapters: bool = True, plan_for: Callable[..., Any] | None = None
                      ) -> tuple[list[list[str]], dict]:
     """``num_samples`` canvases per task, decoded up to their first <eos>.
 
@@ -79,8 +79,9 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
     is the backbone's own decoding through this code path). A left-to-right row stops at its <eos>, or once the
     truncation rule has found its stop in the revealed prefix; neither changes the program.
 
-    ``plan_for`` (the planner stage): (task index, task) -> a one-row ``PlanCache``, built once per task and
-    shared by all of its samples; prompts, seeds and the token draw are the same with and without it.
+    ``plan_for`` (the planner stage): (task index, task, prompt cache, anchor id) -> a one-row ``PlanCache``,
+    built once per task and shared by all of its samples; prompts, seeds and the token draw are the same with and
+    without it. The prompt cache and anchor let an oracle read the reference after the same prompt.
     """
     texts: list[list[str]] = []
     forbidden = [tokenizer.pad_id, tokenizer.bos_id]
@@ -102,7 +103,7 @@ def realizer_samples(realizer: Stage0Realizer, tokenizer: Stage0Tokenizer, tasks
         start = time.perf_counter()
         with autocast(device):
             cache = realizer.prefill(*left_pad([ids[:-1]], tokenizer.pad_id, device))
-            plan = plan_for(index, task) if plan_for is not None else None
+            plan = plan_for(index, task, cache, ids[-1]) if plan_for is not None else None
             rows: list[str] = []
             while len(rows) < num_samples:
                 n = min(batch_size, num_samples - len(rows))

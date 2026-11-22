@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 SLING AI Inc.
 """
-evaluate.py -- Pass@k of a structure-oracle run in Stage 0's harness. A diagnostic: every row is an oracle row.
+evaluate.py -- Pass@k of an oracle run (structure or latent) in Stage 0's harness. A diagnostic: every row is an
+oracle row.
 
     python -m text_vpa.stage1.evaluate --checkpoint runs/stage1-oracle/last.pt --model data2/models/gemma-4-E2B \\
         --eval-dir data2/eval --out runs/stage1-oracle/sweep --plans oracle --k-steps 8 32 128 --orders random
@@ -10,9 +11,10 @@ Prompts, canvas length, token draw, truncation, tests and seeds are Stage 0's (`
 differs from the Stage 0 row of the same K and order by the trained weights and the plan only. The plan
 (``--plans``):
 
-    oracle     the line structure of the problem's normalised reference (``oracle.py``)
+    oracle     the plan of the problem's normalised reference (``oracle.py``: its line structure, or its lines'
+               frozen backbone states read after the problem's prompt)
     null       the bridge's null token: the same weights without a plan
-    shuffled   the structure of the next problem's reference
+    shuffled   the plan of the next problem's reference
 
 MBPP only (the oracle reads a whole reference program), and by default its validation split: nothing of this
 stage is selected on a test set.
@@ -120,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                                         time_input=args.time_input, time_grid=max(cfg.step_budgets))
                 texts, info, followed = oracle_samples(
                     realizer, bridge, oracle, tokenizer, tasks, "mbpp", sampler, cfg.canvas_len, args.num_samples,
-                    args.batch_size, args.seed, device, variant=plan, max_slots=cfg.max_slots, progress=True)
+                    args.batch_size, args.seed, device, variant=plan, max_slots=cfg.max_slots, progress=True,
+                    latent_layers=cfg.latent_layers)
                 summary, rows = score(tasks, "mbpp", texts, args.k, False, args.timeout, args.exec_workers)
                 flat = [row for group in followed for row in group]
                 rows = [{**row, **extra} for row, extra in zip(rows, flat, strict=True)]

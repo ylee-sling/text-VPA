@@ -462,6 +462,29 @@ class Stage0Realizer(nn.Module):
         self.passes["canvas"] += 1
         return hidden
 
+    @torch.no_grad()
+    def frozen_states(self, cache: PrefixCache, canvas_ids: Tensor, num_layers: int) -> Tensor:
+        """The frozen backbone reading a canvas causally after its prompt: hidden states after the first
+        ``num_layers`` blocks, adapters off, no final norm (the planner stage's latent oracle).
+
+        Args:
+            cache: the prompt prefix's keys and values (``prefill``).
+            canvas_ids: ``[B, C]`` int64, [anchor, y^1 .. y^N]: a whole program, no [MASK].
+            num_layers: blocks to run, 1 .. ``num_kv_layers`` (the blocks above reuse keys and values that a
+                partial pass does not compute for the canvas).
+
+        Returns:
+            ``[B, C, d]``; index j has read canvas_ids[:, :j + 1], so index k + 1 is the state after token y^(k+1).
+        """
+        if not 1 <= num_layers <= self.num_kv_layers:
+            raise ValueError(f"num_layers must be in 1 .. {self.num_kv_layers}")
+        canvas_pos = cache.lengths[:, None] + torch.arange(canvas_ids.shape[1], device=canvas_ids.device)[None]
+        masks = canvas_masks(cache.pos, cache.valid, canvas_pos, self.window, "causal")
+        embeds, per_layer = self._embed(canvas_ids, None)
+        hidden = self._run(embeds, per_layer, canvas_pos, masks, cache, num_layers, checkpointing=False)
+        self.passes["frozen"] = self.passes.get("frozen", 0) + 1     # the planner stage's count only
+        return hidden
+
     def logits(self, hidden: Tensor) -> Tensor:
         """``[..., d]`` -> ``[..., S]`` float32 logits with the backbone's final soft cap (30 tanh(x / 30))."""
         logits = self.lm_head(hidden).float()

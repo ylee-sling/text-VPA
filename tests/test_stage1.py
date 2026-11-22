@@ -51,11 +51,15 @@ from text_vpa.stage1.data import (  # noqa: E402
     tokenize_plan_examples,
 )
 from text_vpa.stage1.oracle import (  # noqa: E402
+    LatentOracle,
     StructureOracle,
     TaskPlans,
     kind_match,
+    line_means,
     normalize_reference,
     oracle_samples,
+    reference_canvas,
+    reproduced,
 )
 from text_vpa.stage1.plan import ORACLE_LABEL, OraclePlan, require_oracle_plan  # noqa: E402
 from text_vpa.stage1.slots import (  # noqa: E402
@@ -905,7 +909,9 @@ def test_oracle_training_starts_at_the_stage0_checkpoint_uses_the_plan_and_resum
         for name in first:
             torch.testing.assert_close(second[name], first[name], rtol=1e-5, atol=1e-7, msg=name)
     with pytest.raises(ValueError, match="plan"):
-        build_plan_modules(Stage1Config(plan="oracle-latent"), tiny_realizer()[0])
+        build_plan_modules(Stage1Config(plan="oracle-content"), tiny_realizer()[0])
+    with pytest.raises(ValueError, match="latent_layers"):
+        build_plan_modules(Stage1Config(plan="oracle-latent", latent_layers=5), tiny_realizer()[0])
 
 
 # =============================================================================================
@@ -1014,7 +1020,8 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     row = next(r for r in result["comparison"] if r["k"] == 8 and r["order"] == "exact kernel")
     assert row["oracle"] == 0.3 and row["null"] == 0.1 and row["no_plan"] == 0.0
     assert math.isclose(row["oracle_minus_null"][0], 0.2)
-    assert result["curve"] == [{"step": 20, "probe_pass@1": 0.1, "probe_kind_match": 0.6, "plan_gain_k0": 0.4,
+    assert result["curve"] == [{"step": 20, "probe_pass@1": 0.1, "probe_kind_match": 0.6, "probe_reproduced": None,
+                                "plan_gain_k0": 0.4,
                                 "plan_gain": None, "val_loss_k0": None, "val_loss_null_k0": None, "gate_mean": 0.12}]
     text = (sweep / "report.md").read_text()
     assert text.splitlines()[0].endswith(f"({ORACLE_LABEL})") and text.count(ORACLE_LABEL) >= 4
@@ -1042,3 +1049,196 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     with pytest.raises(ValueError, match="label"):
         report._write(tmp_path / "x", text.replace(ORACLE_LABEL, "a result"), result)
     assert not (tmp_path / "x" / "report.md").exists()
+
+
+# =============================================================================================
+# The latent oracle (step 2)
+# =============================================================================================
+def test_frozen_states_are_the_backbones_causal_states_after_l_blocks():
+    """``frozen_states`` on [anchor, program] after a cached prompt equals the released model's own hidden state
+    after l blocks on [prompt; program], for every l the latent oracle may use; adapters and the bridge play no
+    part."""
+    realizer, bridge, reference = bridged(open_gates=True)
+    randomize_adapters(realizer)                                       # trained adapters must not enter
+    prompt = [2, 30, 31, 32, 33, 34]
+    program = [40, 41, 42, 43, 44, 45, 46, 47]
+    ids = torch.tensor([prompt + program])
+    with torch.no_grad():
+        want = reference(ids, output_hidden_states=True).hidden_states
+        cache = realizer.prefill(*left_pad([prompt[:-1]], 0))
+        canvas = torch.tensor([[prompt[-1], *program]])
+        for layers in range(1, realizer.num_kv_layers + 1):
+            got = realizer.frozen_states(cache, canvas, layers)
+            torch.testing.assert_close(got, want[layers][:, len(prompt) - 1:], rtol=1e-5, atol=1e-5)
+    assert realizer.passes["frozen"] == realizer.num_kv_layers
+    with pytest.raises(ValueError, match="num_layers"):
+        realizer.frozen_states(cache, canvas, realizer.num_kv_layers + 1)
+    # A later token cannot change an earlier state (causal), and the canvas layout is training's.
+    other = canvas.clone()
+    other[0, 5:] = 50
+    with torch.no_grad():
+        a, b = realizer.frozen_states(cache, canvas, 2), realizer.frozen_states(cache, other, 2)
+    torch.testing.assert_close(a[:, :5], b[:, :5], rtol=0, atol=0)
+    assert float((a[:, 5:] - b[:, 5:]).abs().max()) > 1e-4
+    built = reference_canvas(torch.tensor([prompt[-1]]), [program + [9] * 30], 12, eos_id=1)
+    assert built.tolist() == [[prompt[-1], *program, 9, 9, 9, 1]]         # N - 1 program tokens, <eos>: N + 1
+    assert reference_canvas(torch.tensor([7]), [[5, 6]], 5, eos_id=1).tolist() == [[7, 5, 6, 1, 1, 1]]
+
+
+def test_line_means_and_the_latent_plan_against_explicit_loops():
+    torch.manual_seed(0)
+    states = torch.randn(2, 11, 6)                                     # N = 10 canvas tokens, D = 6
+    rows = [LineSlots((kind("def"), kind("return"), kind("blank")), (0, 1, 0), (0, 4, 7), (4, 3, 0), 3),
+            LineSlots((kind("assign"),), (0,), (0,), (9,), 1)]
+    slots = collate_slots(rows, 4)
+    got = line_means(states, slots)
+    want = torch.zeros(2, 4, 6, dtype=torch.float64)
+    for b, row in enumerate(rows):
+        for m in range(row.count):
+            idx = [k + 1 for k in range(row.start[m], row.start[m] + row.length[m])]   # state after token k
+            if idx:
+                want[b, m] = states[b, idx].double().mean(dim=0)
+    torch.testing.assert_close(got.double(), want, rtol=1e-6, atol=1e-6)
+
+    oracle = LatentOracle(6, 16)
+    with torch.no_grad():
+        plan = oracle(states, slots)
+    assert plan.source == "latent" and plan.mask.sum(dim=1).tolist() == [3, 1]
+    for b, row in enumerate(rows):
+        for m in range(4):
+            if m >= row.count:
+                assert not bool(plan.z[b, m].any())
+                continue
+            code = layout_code(torch.tensor(row.start[m]), torch.tensor(row.length[m]), 16).double()
+            value = oracle.layout.weight.double() @ code + oracle.layout.bias.double()
+            if row.length[m]:
+                x = want[b, m]
+                x = (x - x.mean()) / torch.sqrt(x.var(unbiased=False) + oracle.norm.eps)
+                x = x * oracle.norm.weight.double() + oracle.norm.bias.double()
+                value = value + oracle.content.weight.double() @ x + oracle.content.bias.double()
+            torch.testing.assert_close(plan.z[b, m].double(), value, rtol=1e-5, atol=1e-5)
+    # Content enters: other states of the same lines give another plan; an empty line gets its layout only.
+    with torch.no_grad():
+        moved = oracle(states + torch.randn_like(states), slots)
+    assert float((moved.z[0, :2] - plan.z[0, :2]).abs().max()) > 1e-3
+    torch.testing.assert_close(moved.z[0, 2], plan.z[0, 2], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="states"):
+        oracle(states[:1], slots)
+
+
+def test_reproduced_compares_programs_not_formatting():
+    reference = normalize_reference("def f(a):\n  return (a)\n")[0]
+    assert reproduced("def f(a):\n    return a", reference)
+    assert reproduced("def f(a):  # same\n    return (a)\n\n", reference)
+    assert not reproduced("def f(b):\n    return b\n", reference)
+    assert not reproduced("def f(a:\n    return a\n", reference)
+
+
+def test_latent_task_plans_read_the_reference_after_the_problems_prompt():
+    realizer, bridge, _ = bridged(open_gates=True)
+    randomize_adapters(realizer)
+    torch.manual_seed(1)
+    oracle = LatentOracle(realizer.hidden_size, D).eval()
+    tok, tasks = CharTokenizer(), _mbpp_tasks()
+    plans = TaskPlans(bridge, oracle, tok, [t.reference for t in tasks], 64, 8, "oracle", torch.device("cpu"),
+                      realizer=realizer, latent_layers=2)
+    prompt = [2, 30, 31, 32]
+    with torch.no_grad():
+        cache = realizer.prefill(*left_pad([prompt[:-1]], 0))
+        got = plans(1, tasks[1], cache, prompt[-1])
+        canvas = torch.full((1, 65), tok.eos_id, dtype=torch.long)
+        canvas[0, 0] = prompt[-1]
+        ids = tok.encode_batch([plans.texts[1]])[0]
+        canvas[0, 1:1 + len(ids)] = torch.tensor(ids)
+        states = realizer.frozen_states(cache, canvas, 2)
+        plan = oracle(states, collate_slots([plans.slots[1]], 8))
+        want = bridge.project(bridge.conditioning(plan.z, plan.mask))
+    for layer in range(bridge.num_layers):
+        torch.testing.assert_close(got.keys[layer], want.keys[layer], rtol=1e-5, atol=1e-6)
+    with pytest.raises(ValueError, match="prompt cache"):
+        plans(1, tasks[1])
+    with pytest.raises(ValueError, match="frozen backbone"):
+        TaskPlans(bridge, oracle, tok, [t.reference for t in tasks], 64, 8, "oracle", torch.device("cpu"))
+    common = dict(canvas_len=64, num_samples=2, batch_size=2, seed=0, device=torch.device("cpu"))
+    cfg = SamplerConfig(num_steps=4, schedule="cosine", temperature=0.9)
+    texts, info, followed = oracle_samples(realizer, bridge, oracle, tok, tasks, "mbpp", cfg, max_slots=8,
+                                           latent_layers=2, **common)
+    assert info["oracle"] == "latent" and info["label"] == ORACLE_LABEL and 0.0 <= info["reproduced"] <= 1.0
+    assert all("reproduced" in row for group in followed for row in group)
+    nulled, null_info, _ = oracle_samples(realizer, bridge, oracle, tok, tasks, "mbpp", cfg, max_slots=8,
+                                          latent_layers=2, variant="null", **common)
+    assert null_info["oracle"] == "latent" and nulled != texts
+
+
+def test_latent_oracle_training_uses_content_and_frozen_adapters_stay_put(tmp_path):
+    _structured_corpus(tmp_path / "corpus")
+    stage0 = _stage0_checkpoint(tmp_path)
+    init = torch.load(tmp_path / "stage0" / "last.pt", weights_only=True)
+    trainer = _oracle_trainer(tmp_path, "latent", 80, init, plan="oracle-latent", latent_layers=2,
+                              train_adapters=False)
+    assert isinstance(trainer.oracle, LatentOracle)
+    assert not any(p is q for p in trainer.trainable_parameters() for q in trainer.realizer.trainable_parameters())
+    want = stage0.validate()
+    before = trainer.validate()
+    for key in ("val_loss", "val_loss_k0", "val_loss_next"):
+        assert math.isclose(before[key], want[key], rel_tol=1e-6), key     # closed gates: the Stage 0 checkpoint
+    start = {n: p.clone() for n, p in trainer.realizer.trainable_state().items()}
+    trainer.set_training(True)
+    for _ in range(80):
+        last = trainer.train_step()
+    after = trainer.validate()
+    assert math.isfinite(last["loss"]) and last["gate_mean"] > 0
+    assert after["plan_gain_k0"] > 0.02 and after["val_loss_k0"] < after["val_loss_shuffled_k0"]
+    for name, value in trainer.realizer.trainable_state().items():
+        assert torch.equal(value, start[name]), name                    # frozen: the init checkpoint's values
+    assert all(p.requires_grad for p in trainer.realizer.trainable_parameters())   # its checkpoint format holds
+    trainer.save()
+    payload = torch.load(tmp_path / "latent" / "last.pt", weights_only=True)
+    assert payload["plan"] == "oracle-latent" and payload["config"]["train_adapters"] is False
+    assert set(payload["trainable"]) == set(init["trainable"])
+    assert {"norm.weight", "content.weight", "layout.weight"} <= set(payload["oracle_encoder"])
+
+
+
+def test_step2_gate_and_the_latent_report(tmp_path):
+    from text_vpa.stage1 import report
+    from text_vpa.stage1.report import latent_reading, step2_gate
+
+    assert step2_gate(0.6, 0.55, 0.7).startswith("clearly at least 0.5") and "carries content" in step2_gate(0.6, 0.4, 0.7)
+    assert step2_gate(0.3, 0.15, 0.45).startswith("clearly between 0.1 and 0.5")
+    assert step2_gate(0.0, 0.0, 0.0).startswith("clearly under 0.1") and "closed" in step2_gate(0.0, 0.0, 0.0)
+    assert latent_reading(0.0, 0.0, 0.0, 1.5, 2.98) == step2_gate(0.0, 0.0, 0.0)    # carried more: read
+    assert latent_reading(0.0, 0.0, 0.0, 3.1, 2.98).startswith("NOT READ: the latent plan did not carry more")
+    assert latent_reading(0.0, 0.0, 0.0, None, 2.98).startswith("NOT READ") and latent_reading(0.6, 0.5, 0.7, None, None) \
+        == step2_gate(0.6, 0.5, 0.7)
+
+    label = {"stage": "stage1-oracle", "label": ORACLE_LABEL, "step": 40, "oracle": "latent"}
+    sweep, reference = tmp_path / "sweep", tmp_path / "stage0-sweep"
+    _write_row(sweep, "oracle-K8", 0, plan="oracle", kind_match=0.9, line_count_match=0.8, reproduced=0.0, **label)
+    _write_row(sweep, "oracle-K256-left_to_right", 5, plan="oracle", kind_match=0.97, line_count_match=0.9,
+               reproduced=0.42, order="left_to_right", num_steps=256, canvas_len=256, **label)
+    _write_row(reference, "ar", 6)
+
+    def metrics(run, loss_k0):
+        run.mkdir()
+        with open(run / "metrics.jsonl", "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"step": 40, "eval/plan_gain_k0": 2.0, "eval/val_loss_k0": loss_k0,
+                                     "eval/val_loss_null_k0": 4.2, "eval/probe_reproduced": 0.1}) + "\n")
+
+    metrics(tmp_path / "latent", 1.4)
+    metrics(tmp_path / "structure", 2.984)
+    args = ["--eval", str(sweep), "--run", str(tmp_path / "latent"), "--reference", str(reference)]
+    assert report.main([*args, "--structure-run", str(tmp_path / "structure")]) == 0
+    result = json.loads((sweep / "report.json").read_text())
+    assert result["oracle"] == "latent" and result["carried"] == {"latent_loss": 1.4, "null_loss": 4.2,
+                                                                   "structure_loss": 2.984}
+    assert result["gate"]["verdict"].startswith("clearly under 0.1") and "closed" in result["gate"]["verdict"]
+    text = (sweep / "report.md").read_text()
+    assert text.startswith(f"# Text-VPA Stage 1, step 2: the latent oracle ({ORACLE_LABEL})")
+    assert "## Gate after step 2" in text and "Did the content reach the realizer?" in text and "42.0%" in text
+    assert report.main(args) == 0                                      # without the structure run: not read
+    assert json.loads((sweep / "report.json").read_text())["gate"]["verdict"].startswith("NOT READ")
+    _write_row(sweep, "null-K8", 0, plan="null", stage="stage1-oracle", label=ORACLE_LABEL, step=40,
+               oracle="structure")
+    with pytest.raises(ValueError, match="different oracles"):
+        report.main(args)
