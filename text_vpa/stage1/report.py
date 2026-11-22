@@ -47,10 +47,15 @@ rho, on the latent oracle's ``oracle-K8``:
                         cannot meet H2 here, and what content buys at K = 32 and K = 128 is reported
     rho < 0.1           the plan route is closed for this realizer: distillation (Sec. 5.1) or more depth
 
-Reading the latent oracle: a band under 0.5 is read only if the latent plan carried more than the structure did,
-i.e. its held-out loss with every token masked at the last evaluation is below the structure oracle's at its last
-evaluation (``--structure-run``; 2.984 nats per token at step 5,000). Otherwise the report prints NOT READ. The
-share of samples that reproduce the reference at one token per step is reported alongside, without a threshold.
+Reading the latent oracle (revised on 22 Nov 2026 before the run; the first version, "all-masked loss below the
+structure oracle's 2.984", was met by any plan carrying content and could not support "the route is closed"): a
+band under 0.5 is read only if the content reached the realizer on MBPP itself: at one token per step, at least
+half of the samples reproduce the reference program (the same syntax tree; ``CONTENT``). Then the realizer, given
+the plan, can write the program out, and a ratio under 0.5 is about parallel decisions, not about missing content.
+Otherwise NOT READ. Reported without a threshold: K = 8 Pass@1 on the problems where the content arrived (at least
+half of their one-token-per-step samples reproduce the reference), against the baseline on the same problems (the
+check that settled step 1); the all-masked held-out loss against the structure oracle's and against the plan-free
+realizer's next-token loss with the full left context (this run's step 0).
 
 The baseline is ``REFERENCE/mbpp/ar`` (the Stage 0 sweep of the checkpoint the oracle started from) or, without
 ``--reference``, ``EVAL/mbpp/ar``; it must have been scored on the same problems. The reference's
@@ -72,15 +77,17 @@ from text_vpa.stage0.report import bootstrap_ratio, per_task_rates
 from text_vpa.stage1.oracle import PLAN_VARIANTS
 from text_vpa.stage1.plan import ORACLE_LABEL
 
-__all__ = ["BUILD", "CLOSED", "DELIVERY", "GATE_ROW", "bootstrap_difference", "delivery_row", "delivery_verdict",
-           "gate_reading", "is_oracle_row", "latent_reading", "render", "step1_gate", "step2_gate"]
+__all__ = ["BUILD", "CLOSED", "CONTENT", "DELIVERY", "GATE_ROW", "bootstrap_difference", "content_subset",
+           "delivery_row", "delivery_verdict", "gate_reading", "is_oracle_row", "latent_reading", "render",
+           "step1_gate", "step2_gate"]
 
 STAGE = "stage1-oracle"
 BASELINE = "ar"
 GATE_ROW = "oracle-K8"                                   # exact jump kernel, K = 8
 DELIVERY_ROW = "oracle-K256-left_to_right"               # one token per step on the 256-token canvas
 BUILD, CLOSED = 0.5, 0.1                                 # the gate's two thresholds
-DELIVERY = 0.9                                           # kind_match at one token per step
+DELIVERY = 0.9                                           # kind_match at one token per step (step 1)
+CONTENT = 0.5                                            # reproduced at one token per step (step 2)
 K_ROWS: tuple[tuple[int, str], ...] = ((8, "random"), (32, "random"), (128, "random"), (8, "confidence"),
                                        (32, "confidence"), (128, "confidence"), (256, "left_to_right"))
 
@@ -119,20 +126,43 @@ def step2_gate(rho: float, low: float, high: float) -> str:
         "(distillation or more depth)"
 
 
-def latent_reading(rho: float, low: float, high: float, latent_loss: float | None,
-                   structure_loss: float | None) -> str:
-    """The step-2 band as it may be read: under 0.5 only if the latent plan carried more than the structure."""
+def latent_reading(rho: float, low: float, high: float, reproduced: float | None) -> str:
+    """The step-2 band as it may be read: under 0.5 only if, at one token per step, at least ``CONTENT`` of the
+    samples reproduce the reference (the content reached the realizer)."""
     band = step2_gate(rho, low, high)
     if math.isnan(rho) or rho >= BUILD:
         return band
-    if latent_loss is None or structure_loss is None:
-        return ("NOT READ: the all-masked held-out losses of this run and of the structure oracle are needed "
-                "(--run and --structure-run)")
-    if latent_loss < structure_loss:
+    if reproduced is None:
+        return ("NOT READ: the one-token-per-step row is missing, so it is not known whether the content reached "
+                "the realizer")
+    if reproduced >= CONTENT:
         return band
-    return (f"NOT READ: the latent plan did not carry more than the structure (all-masked loss {latent_loss:.3f} "
-            f"against the structure oracle's {structure_loss:.3f}), so a ratio under 0.5 says nothing yet about "
-            "content (docs/stage1.md)")
+    return (f"NOT READ: the content did not reach the realizer (at one token per step {reproduced:.1%} of the "
+            f"samples reproduce the reference, under {CONTENT:.0%}), so a ratio under 0.5 says nothing yet about "
+            "parallel decisions (docs/stage1.md)")
+
+
+def _per_task(path: Path, field: str) -> dict[str, float]:
+    """Per-problem mean of a boolean sample field (``passed``, ``reproduced``) in a samples.jsonl."""
+    values: dict[str, list[float]] = {}
+    if path.exists():
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                if field in row:
+                    values.setdefault(row["task_id"], []).append(float(bool(row[field])))
+    return {task: sum(v) / len(v) for task, v in values.items()}
+
+
+def content_subset(one_per_step: Path, parallel: Path, baseline: Path) -> dict[str, Any]:
+    """K = 8 Pass@1 on the problems whose one-token-per-step samples reproduce the reference at least half the
+    time, and the baseline's Pass@1 on the same problems (samples.jsonl paths)."""
+    copied = _per_task(one_per_step, "reproduced")
+    k8, base = _per_task(parallel, "passed"), _per_task(baseline, "passed")
+    chosen = sorted(t for t, rate in copied.items() if rate >= CONTENT and t in k8 and t in base)
+    return {"problems": len(chosen), "of": len(copied),
+            "oracle_k8": float(np.mean([k8[t] for t in chosen])) if chosen else None,
+            "baseline": float(np.mean([base[t] for t in chosen])) if chosen else None}
 
 
 def gate_reading(rho: float, low: float, high: float, kind_match: float | None) -> str:
@@ -206,7 +236,8 @@ def _curve(run_dir: Path | None) -> list[dict[str, Any]]:
                         "probe_kind_match": row.get("eval/probe_kind_match"),
                         "probe_reproduced": row.get("eval/probe_reproduced"),
                         "plan_gain_k0": row.get("eval/plan_gain_k0"), "plan_gain": row.get("eval/plan_gain"),
-                        "val_loss_k0": row.get("eval/val_loss_k0"), "val_loss_null_k0": row.get("eval/val_loss_null_k0")}
+                        "val_loss_k0": row.get("eval/val_loss_k0"), "val_loss_null_k0": row.get("eval/val_loss_null_k0"),
+                        "val_loss_next": row.get("eval/val_loss_next")}
                 if "train/gate_mean" in row:
                     gate[int(row["step"])] = float(row["train/gate_mean"])
     out = [points[step] for step in sorted(points)]
@@ -260,14 +291,25 @@ def render(result: dict[str, Any]) -> str:
                      f"{pct(gate['baseline'])}, oracle at K = 8 {pct(gate['oracle'])}: rho = "
                      f"{gate['rho']:.3f} [{gate['low']:.3f}, {gate['high']:.3f}]: {gate['verdict']}")
     if latent:
-        carried = result["carried"]
+        carried, subset = result["carried"], result.get("content_subset") or {}
+        reproduced = result["delivery"].get("reproduced")
+        reached = ("not evaluated" if reproduced is None else "the content reaches the realizer"
+                   if reproduced >= CONTENT else "NOT shown")
         lines += ["", "## Did the content reach the realizer?", "",
-                  "Held-out loss with every token masked at the last evaluation, nats per token: this run's oracle "
-                  "plan against the structure oracle's.", "",
-                  f"- latent oracle {num(carried.get('latent_loss'))}, structure oracle "
-                  f"{num(carried.get('structure_loss'))}, null plan {num(carried.get('null_loss'))}",
-                  f"- reproduces the reference at one token per step (`{result['delivery']['row']}`): "
-                  f"{pct(result['delivery'].get('reproduced'))}"]
+                  f"At one token per step (`{result['delivery']['row']}`) at least {CONTENT:.0%} of the samples must "
+                  "reproduce the reference program (the same syntax tree).", "",
+                  f"- reproduces the reference: {pct(reproduced)}: {reached}"]
+        if subset.get("problems"):
+            lines.append(f"- K = 8 on the {subset['problems']} of {subset['of']} problems where the content arrived "
+                         f"(at least half of their one-token-per-step samples reproduce the reference): oracle "
+                         f"{pct(subset['oracle_k8'])}, baseline {pct(subset['baseline'])} on the same problems")
+        elif subset:
+            lines.append("- no problem where at least half of the one-token-per-step samples reproduce the reference")
+        lines.append(f"- held-out loss with every token masked at the last evaluation, nats per token: latent oracle "
+                     f"{num(carried.get('latent_loss'))}, structure oracle {num(carried.get('structure_loss'))}, "
+                     f"null plan {num(carried.get('null_loss'))}; the plan-free realizer's next-token loss with the "
+                     f"full left context {num(carried.get('next_token_loss'))} (the all-masked mean includes the "
+                     "<eos> filling at weight 0.1)")
     else:
         lines += ["", "## Did the structure reach the realizer?", "",
                   f"At one token per step (`{result['delivery']['row']}`) the samples must have the planned kind on "
@@ -381,16 +423,22 @@ def main(argv: list[str] | None = None) -> int:
     delivered = oracle_rows.get(one_per_step, {}).get("kind_match")
     curve = _curve(args.run)
     structure_curve = _curve(args.structure_run)
+    start = next((point for point in curve if point["step"] == 0), None)
     carried = {"latent_loss": curve[-1]["val_loss_k0"] if curve else None,
                "null_loss": curve[-1]["val_loss_null_k0"] if curve else None,
-               "structure_loss": structure_curve[-1]["val_loss_k0"] if structure_curve else None}
+               "structure_loss": structure_curve[-1]["val_loss_k0"] if structure_curve else None,
+               "next_token_loss": start["val_loss_next"] if start else None}
+    reproduced = oracle_rows.get(one_per_step, {}).get("reproduced")
+    subset: dict[str, Any] = {}
+    if kind == "latent" and one_per_step in oracle_rows and GATE_ROW in oracle_rows and baseline_dir is not None:
+        subset = content_subset(bench / one_per_step / "samples.jsonl", bench / GATE_ROW / "samples.jsonl",
+                                baseline_dir / BASELINE / "samples.jsonl")
     if gate.get("rho") is not None:
-        gate["verdict"] = (latent_reading(gate["rho"], gate["low"], gate["high"], carried["latent_loss"],
-                                          carried["structure_loss"]) if kind == "latent"
+        gate["verdict"] = (latent_reading(gate["rho"], gate["low"], gate["high"], reproduced) if kind == "latent"
                            else gate_reading(gate["rho"], gate["low"], gate["high"], delivered))
     delivery = {"row": one_per_step, "kind_match": delivered, "threshold": DELIVERY,
                 "verdict": delivery_verdict(delivered),
-                "reproduced": oracle_rows.get(one_per_step, {}).get("reproduced"),
+                "reproduced": reproduced,
                 "null_kind_match": oracle_rows.get(delivery_row(oracle_rows, "null"), {}).get("kind_match")}
     for tag, s in oracle_rows.items():
         if s.get("references_not_parsed") or s.get("references_truncated"):
@@ -402,8 +450,8 @@ def main(argv: list[str] | None = None) -> int:
     if len(steps) > 1:
         notes.append(f"the rows come from different checkpoint steps: {steps}")
     result = {"oracle": kind, "rows": rows, "comparison": comparison, "gate": gate, "delivery": delivery,
-              "carried": carried, "curve": curve, "notes": notes,
-              "thresholds": {"build": BUILD, "closed": CLOSED, "delivery": DELIVERY}}
+              "carried": carried, "content_subset": subset, "curve": curve, "notes": notes,
+              "thresholds": {"build": BUILD, "closed": CLOSED, "delivery": DELIVERY, "content": CONTENT}}
     text = render(result)
     _write(out, text, result)
     print(text)

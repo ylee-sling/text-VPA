@@ -1022,7 +1022,8 @@ def test_step1_gate_and_the_report_refuse_to_drop_the_label(tmp_path):
     assert math.isclose(row["oracle_minus_null"][0], 0.2)
     assert result["curve"] == [{"step": 20, "probe_pass@1": 0.1, "probe_kind_match": 0.6, "probe_reproduced": None,
                                 "plan_gain_k0": 0.4,
-                                "plan_gain": None, "val_loss_k0": None, "val_loss_null_k0": None, "gate_mean": 0.12}]
+                                "plan_gain": None, "val_loss_k0": None, "val_loss_null_k0": None,
+                                "val_loss_next": None, "gate_mean": 0.12}]
     text = (sweep / "report.md").read_text()
     assert text.splitlines()[0].endswith(f"({ORACLE_LABEL})") and text.count(ORACLE_LABEL) >= 4
     assert "rho = 0.500" in text and "the structure reaches the realizer" in text and "10 problems x 5 samples" in text
@@ -1202,42 +1203,69 @@ def test_latent_oracle_training_uses_content_and_frozen_adapters_stay_put(tmp_pa
 
 def test_step2_gate_and_the_latent_report(tmp_path):
     from text_vpa.stage1 import report
-    from text_vpa.stage1.report import latent_reading, step2_gate
+    from text_vpa.stage1.report import CONTENT, content_subset, latent_reading, step2_gate
 
     assert step2_gate(0.6, 0.55, 0.7).startswith("clearly at least 0.5") and "carries content" in step2_gate(0.6, 0.4, 0.7)
     assert step2_gate(0.3, 0.15, 0.45).startswith("clearly between 0.1 and 0.5")
     assert step2_gate(0.0, 0.0, 0.0).startswith("clearly under 0.1") and "closed" in step2_gate(0.0, 0.0, 0.0)
-    assert latent_reading(0.0, 0.0, 0.0, 1.5, 2.98) == step2_gate(0.0, 0.0, 0.0)    # carried more: read
-    assert latent_reading(0.0, 0.0, 0.0, 3.1, 2.98).startswith("NOT READ: the latent plan did not carry more")
-    assert latent_reading(0.0, 0.0, 0.0, None, 2.98).startswith("NOT READ") and latent_reading(0.6, 0.5, 0.7, None, None) \
-        == step2_gate(0.6, 0.5, 0.7)
+    # A band under 0.5 is read only once the content reached the realizer (reproduction at one token per step).
+    assert CONTENT == 0.5
+    assert latent_reading(0.0, 0.0, 0.0, 0.6) == step2_gate(0.0, 0.0, 0.0)
+    assert latent_reading(0.0, 0.0, 0.0, 0.5) == step2_gate(0.0, 0.0, 0.0)
+    assert latent_reading(0.0, 0.0, 0.0, 0.42).startswith("NOT READ: the content did not reach the realizer")
+    assert latent_reading(0.3, 0.1, 0.45, None).startswith("NOT READ")
+    assert latent_reading(0.6, 0.5, 0.7, None) == step2_gate(0.6, 0.5, 0.7)      # at least 0.5: read regardless
 
     label = {"stage": "stage1-oracle", "label": ORACLE_LABEL, "step": 40, "oracle": "latent"}
     sweep, reference = tmp_path / "sweep", tmp_path / "stage0-sweep"
-    _write_row(sweep, "oracle-K8", 0, plan="oracle", kind_match=0.9, line_count_match=0.8, reproduced=0.0, **label)
+    _write_row(sweep, "oracle-K8", 1, plan="oracle", kind_match=0.9, line_count_match=0.8, reproduced=0.0, **label)
     _write_row(sweep, "oracle-K256-left_to_right", 5, plan="oracle", kind_match=0.97, line_count_match=0.9,
-               reproduced=0.42, order="left_to_right", num_steps=256, canvas_len=256, **label)
+               reproduced=0.44, order="left_to_right", num_steps=256, canvas_len=256, **label)
+    # Problems 0 to 3 are reproduced by all five samples at one token per step, problem 4 by two: 22 of 50.
+    l2r = sweep / "mbpp" / "oracle-K256-left_to_right"
+    with open(l2r / "samples.jsonl", "w", encoding="utf-8") as handle:
+        for task in range(10):
+            for j in range(5):
+                copy = task < 4 or (task == 4 and j < 2)
+                handle.write(json.dumps({"task_id": f"MBPP/{task}", "sample": j, "passed": task < 5,
+                                         "reproduced": copy}) + "\n")
     _write_row(reference, "ar", 6)
+    subset = content_subset(l2r / "samples.jsonl", sweep / "mbpp" / "oracle-K8" / "samples.jsonl",
+                            reference / "mbpp" / "ar" / "samples.jsonl")
+    assert subset == {"problems": 4, "of": 10, "oracle_k8": 0.25, "baseline": 1.0}
 
     def metrics(run, loss_k0):
         run.mkdir()
         with open(run / "metrics.jsonl", "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"step": 0, "eval/plan_gain_k0": 0.0, "eval/val_loss_k0": 4.134,
+                                     "eval/val_loss_null_k0": 4.134, "eval/val_loss_next": 0.933}) + "\n")
             handle.write(json.dumps({"step": 40, "eval/plan_gain_k0": 2.0, "eval/val_loss_k0": loss_k0,
                                      "eval/val_loss_null_k0": 4.2, "eval/probe_reproduced": 0.1}) + "\n")
 
     metrics(tmp_path / "latent", 1.4)
     metrics(tmp_path / "structure", 2.984)
-    args = ["--eval", str(sweep), "--run", str(tmp_path / "latent"), "--reference", str(reference)]
-    assert report.main([*args, "--structure-run", str(tmp_path / "structure")]) == 0
+    args = ["--eval", str(sweep), "--run", str(tmp_path / "latent"), "--reference", str(reference),
+            "--structure-run", str(tmp_path / "structure")]
+    assert report.main(args) == 0
     result = json.loads((sweep / "report.json").read_text())
     assert result["oracle"] == "latent" and result["carried"] == {"latent_loss": 1.4, "null_loss": 4.2,
-                                                                   "structure_loss": 2.984}
-    assert result["gate"]["verdict"].startswith("clearly under 0.1") and "closed" in result["gate"]["verdict"]
+                                                                   "structure_loss": 2.984, "next_token_loss": 0.933}
+    assert result["content_subset"] == subset and result["thresholds"]["content"] == 0.5
+    gate = result["gate"]
+    assert gate["band"] == step2_gate(gate["rho"], gate["low"], gate["high"]) and "between 0.1 and 0.5" in gate["band"]
+    assert gate["verdict"].startswith("NOT READ: the content did not reach the realizer")   # rho = 0.1 / 0.6
     text = (sweep / "report.md").read_text()
     assert text.startswith(f"# Text-VPA Stage 1, step 2: the latent oracle ({ORACLE_LABEL})")
-    assert "## Gate after step 2" in text and "Did the content reach the realizer?" in text and "42.0%" in text
-    assert report.main(args) == 0                                      # without the structure run: not read
-    assert json.loads((sweep / "report.json").read_text())["gate"]["verdict"].startswith("NOT READ")
+    assert "## Gate after step 2" in text and "Did the content reach the realizer?" in text
+    assert "reproduces the reference: 44.0%: NOT shown" in text and "K = 8 on the 4 of 10 problems" in text
+    assert "oracle 25.0%, baseline 100.0% on the same problems" in text and "0.933" in text
+    # With the content delivered the band is read.
+    summary = l2r / "summary.json"
+    summary.write_text(json.dumps({**json.loads(summary.read_text()), "reproduced": 0.6}))
+    assert report.main(args) == 0
+    gate = json.loads((sweep / "report.json").read_text())["gate"]
+    assert gate["verdict"] == gate["band"] and "cannot meet H2" in gate["verdict"]
+    assert "the content reaches the realizer" in (sweep / "report.md").read_text()
     _write_row(sweep, "null-K8", 0, plan="null", stage="stage1-oracle", label=ORACLE_LABEL, step=40,
                oracle="structure")
     with pytest.raises(ValueError, match="different oracles"):

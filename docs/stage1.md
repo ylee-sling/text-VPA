@@ -3,11 +3,11 @@
 Written on 21 Nov 2026, after the second Stage 0 run. It fixes the order of experiments, their gates and the open
 choices before any of them exists, in the way `docs/stage0.md` did for Stage 0.
 
-**Status (22 Nov 2026, morning).** The author confirmed the design's three open choices on 21 Nov: slots are
+**Status (22 Nov 2026, 11:00).** The author confirmed the design's three open choices on 21 Nov: slots are
 lines, modes are line skeletons, the bridge has no s_x rows. Step 1, the structure oracle, ran on 21 to 22 Nov
-(`runs/stage1-oracle`): **clearly under 0.1** (rho = 0.000 [0.000, 0.000]; "Step 1: result" below). Step 2, the
-latent oracle, is built and has not run ("Step 2 as built"). Steps 3 and 4 are not built. The gates of step 1 are
-unchanged; those of step 2 were written on 22 Nov before it ran.
+(`runs/stage1-oracle`, finished 10:38 KST): **clearly under 0.1** (rho = 0.000 [0.000, 0.000]; "Step 1: result"
+below). It also answers steps 3 and 4 as designed (same section). Step 2, the latent oracle, is built and has not
+run; its reading rule was revised on 22 Nov before the run ("Step 2 as built"). Steps 3 and 4 are not built.
 
 ## The question
 
@@ -324,12 +324,15 @@ the start (a resumed run continues at the floor learning rate, which is too low 
 
 5,000 steps from `runs/stage0-a/last.pt` (adapters trained too), MBPP validation, 90 problems x 5 samples.
 
-| Pass@1 | K = 8 | K = 32 | K = 128 | one token per step |
+| Pass@1 (parses) | K = 8 | K = 32 | K = 128 | one token per step |
 |---|---|---|---|---|
-| no plan (`runs/stage0-a`) | 0.4% | 1.1% | 0.7% | 17.1% |
-| structure oracle, exact kernel / left to right | 0.0% | 0.2% | 0.4% | 7.3% |
-| parses, structure oracle | 12.4% | 14.7% | 22.2% | 77.1% (no plan: 98.2%) |
-| kind match, structure oracle (no working plan: 0.14 to 0.26) | 0.719 | 0.760 | 0.775 | 0.791 |
+| `runs/stage0-a`, no plan, exact kernel / left to right | 0.4% | 1.1% | 0.7% | 17.1% (98.2%) |
+| same weights as the oracle, null plan, exact kernel / left to right | 0.0% (5.3%) | 0.2% (11.3%) | 0.0% (14.7%) | 13.8% (97.6%) |
+| structure oracle, exact kernel / left to right | 0.0% (12.4%) | 0.2% (14.7%) | 0.4% (22.2%) | 7.3% (77.1%) |
+| oracle - null, 95% paired bootstrap, points | +0.0 [+0.0, +0.0] | +0.0 [-0.7, +0.7] | +0.4 [+0.0, +1.1] | **-6.4 [-12.9, -0.2]** |
+| `runs/stage0-a`, no plan, confidence order | 0.0% | 2.0% | 9.8% | |
+| structure oracle, confidence order | 0.0% (0.2%) | 0.0% (5.6%) | 0.2% (27.6%) | |
+| kind match: structure oracle / null plan, exact kernel and left to right | 0.719 / 0.230 | 0.760 / 0.278 | 0.775 / 0.297 | 0.791 / 0.276 |
 
 - **Step 0 equalled `runs/stage0-a`** exactly (val_loss 2.7907, val_loss_next 0.9332, probe 0.44%).
 - **The plan was used heavily.** Held-out loss with every token masked, oracle / null / another function's plan, nats
@@ -345,9 +348,27 @@ the start (a resumed run continues at the floor learning rate, which is too low 
   as **clearly under 0.1** anyway. The check was meant to catch a structure that did not reach the realizer; the
   kind-match buckets show that where it fully arrived it was not enough, and a longer run would not change that.
   By the gate: step 2.
-- Speed 0.150 steps/s with activation checkpointing (11.6 GiB); 5,000 steps 9.3 h; evaluation about 4 h.
-- Pending at the time of writing: the null-plan rows (does the plan, or the extra training, cost the realizer at one
-  token per step?).
+- **Within the same weights the plan changes nothing at parallel K and costs Pass@1 at one token per step:** -6.4
+  points [-12.9, -0.2] (parses 97.6% to 77.1%). A layout the realizer trusts (another function's plan: 12.7 nats)
+  pushes it into the reference's form, which it then fills with its own content.
+- **The extra training cost a little without a plan:** null plan 13.8% against `runs/stage0-a`'s 17.1% at one token
+  per step (its interval is computed by the `TRAIN_ADAPTERS` check of step 2). It includes the known confound: a
+  model trained to lean on a plan is weaker without one.
+- **Confidence order collapses with the plan:** 0.0 / 0.0 / 0.2% at K = 8 / 32 / 128, against `runs/stage0-a`'s
+  0.0 / 2.0 / 9.8% (no null-plan row in this order). A likely explanation, not tested: with the layout known the
+  realizer is confident about structural tokens all over the canvas, so confidence order stops growing a prefix.
+- Speed 0.150 steps/s with activation checkpointing (11.6 GiB); the whole run, tests to report, took about 13.5 h.
+
+**What this implies for steps 3 and 4 as designed** (an argument from the measurements, not a measurement). A line
+skeleton, the mode of step 3, is a function of the structure oracle's plan (its kinds and depths, without the
+layout). The predicted plan g_phi(s_x, u, Delta) is a function of the prompt and the mode, so beyond what the
+realizer already has from the prompt it can carry at most what the mode carries (Proposition 1(a)), at most ln 1024
+= 6.9 nats per program. The structure oracle gave the realizer all of that and more: 1.18 nats per masked token at
+the all-masked state, well over an order of magnitude more per program. Within the same weights it changed nothing
+at K = 8 (+0.0 [+0.0, +0.0]) and cost Pass@1 at one token per step. So the planner of steps 3 and 4, as designed,
+cannot meet H2 with this realizer, whatever step 2 shows. The argument assumes that a plan holding less about the
+program does not do better at K = 8 than one holding more, which is what the K = 8 rows show between null and
+oracle. Step 2 asks about a different route.
 
 ## Step 2 as built (22 Nov 2026): the latent oracle
 
@@ -365,6 +386,10 @@ evaluation the normalised MBPP reference, after the same prompt the realizer see
 
 What it decides: whether *any* slot plan (32 rows of width 256 about the reference) can drive this realizer at K = 8.
 It carries more than any mode the method could sample, so it is an upper bound for plans, not a candidate method.
+After step 1 (above) the planner of steps 3 and 4 is answered, so step 2's question is the route the paper names
+for modes that cannot be enumerated (Sec. 2): a stochastic latent predictor that samples the content of the plan.
+The latent oracle is close to conditioning the realizer on the paper's own JEPA target (slot-pooled states of y),
+which the anti-leakage rule forbids for the method: the best case for the paper's plan representation.
 
 **Gate after step 2** (written 22 Nov 2026, before it ran; `report.step2_gate`), the same rho on its `oracle-K8`:
 
@@ -376,10 +401,21 @@ It carries more than any mode the method could sample, so it is an upper bound f
 - under 0.1: the plan route is closed for this realizer. The choice is between the paper's distillation (Sec. 5.1)
   and more depth.
 
-**Reading rule** (replaces step 1's delivery check): a band under 0.5 is read only if the latent plan carried more
-than the structure did, i.e. its all-masked held-out loss at the last evaluation is below the structure oracle's
-(2.984 at step 5,000; same held-out functions and draws). Otherwise NOT READ. Reported without a threshold: the
-share of samples that reproduce the reference program (same syntax tree) at each K, and the kind match.
+**Reading rule** (replaces step 1's delivery check; revised on 22 Nov 2026 before the run, `report.latent_reading`).
+A band under 0.5 is read only if the content reached the realizer on MBPP itself: **at one token per step, at least
+half of the samples reproduce the reference program** (the same syntax tree after normalisation). Then the realizer,
+given the plan, can write the program out, and a ratio under 0.5 is about parallel decisions, not about missing
+content. Otherwise NOT READ. A band of at least 0.5 needs no check.
+
+The first version (all-masked held-out loss below the structure oracle's 2.984) is withdrawn: any plan that carries
+content passes it, so it could not support "the plan route is closed", the conclusion the gate draws from a band
+under 0.1.
+
+Reported without a threshold: K = 8 Pass@1 on the problems where the content arrived (at least half of their
+one-token-per-step samples reproduce the reference), against the baseline on the same problems (the check that
+settled step 1); the share of samples reproducing the reference and the kind match at each K; the all-masked
+held-out loss against the structure oracle's and against the plan-free realizer's next-token loss with the full left
+context (this run's step 0, 0.933; the all-masked mean includes the <eos> filling at weight 0.1).
 
 **Realizer adapters** (`TRAIN_ADAPTERS`): 1 trains them as in step 1 (one change between the two steps, and the plan
 gets the best chance: an upper bound). 0 keeps them at `runs/stage0-a`'s values, so that "no plan" is exactly the
@@ -391,6 +427,7 @@ training itself degraded the realizer); then 0.
     PLAN=oracle-latent bash scripts/ncp/stage1.sh                # runs/stage1-latent; TRAIN_ADAPTERS=0 to freeze
     RUN=runs/stage1-latent bash scripts/ncp/stage1.sh status
 
-Expected cost (to be measured by the smoke run): one more forward pass through 15 of 35 blocks per micro-batch,
-without gradient, about 10% of a training step; 5,000 steps about 10.3 h, with evaluation about 15 to 16 h.
+Expected cost (measured by the run itself; the smoke run is optional, since the full run reaches every new code
+path at step 0): one more forward pass through 15 of 35 blocks per micro-batch, without gradient, about 10% of a
+training step; 5,000 steps about 10.3 h, with evaluation about 15 to 16 h.
 
