@@ -493,3 +493,16 @@ oracles. A plan that did carry the content would let the realizer nearly copy th
 nothing about whether a planner can sample such content from the prompt; the measured gap says an imperfect content
 plan hurts unless the realizer is trained on imperfect plans. Distillation is the paper's own instrument for the
 parallel step and is untested here.
+
+**Decision (the author's, 23 Nov 2026).** The oracles stop, and the implication for steps 3 and 4 is accepted:
+the planner as designed cannot meet H2 with this realizer. Text-VPA's H2 stays as it was tested (K = 8 on a whole
+canvas) and failed. The work continues as Chat-VPA (semi-autoregressive block discrete flow matching with
+autoregressive trajectory distillation; preprint draft of 22 Nov 2026) in a new repository,
+https://github.com/ylee-sling/chat-VPA, initialized from this repository's Stage 0 code at this commit's parent
+(`ff747c9`). Its first experiment, E0, runs on this harness: the same corpus, prompts, draw and MBPP validation
+split as `runs/stage0-a`.
+
+One correction for the Chat-VPA draft, measured on this repository's sampler: at K = 128 the left-to-right order
+reveals one token per pass for the first 42 passes and two afterwards (cosine schedule, N = 256), so over a
+typical program of about 48 tokens it decides one token per pass, not two. At K = 32 it reveals 1, 1, 2, 2, 3, 3,
+4, 5, 5, 6, 6, 7, 7 and 7 tokens over the first 59 positions; at K = 8, 5, 15, 24, 32, 39, 44, 48 and 49.
