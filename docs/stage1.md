@@ -435,3 +435,61 @@ Expected cost (measured by the run itself; the smoke run is optional, since the 
 path at step 0): one more forward pass through 15 of 35 blocks per micro-batch, without gradient, about 10% of a
 training step; 5,000 steps about 10.3 h, with evaluation about 15 to 16 h.
 
+## Step 2: result (`runs/stage1-latent`, 22 to 23 Nov 2026; oracle: not the method)
+
+5,000 steps from `runs/stage0-a/last.pt` (adapters trained, `TRAIN_ADAPTERS` = 1), 0.142 steps/s with activation
+checkpointing; launched 22 Nov about 14:55 KST, report written 23 Nov 05:22 KST. MBPP validation, 90 problems x 5
+samples.
+
+| Pass@1 (parses) | K = 8 | K = 32 | K = 128 | one token per step |
+|---|---|---|---|---|
+| `runs/stage0-a`, no plan, exact kernel / left to right | 0.4% | 1.1% | 0.7% | 17.1% (98.2%) |
+| same weights as the oracle, null plan | 0.2% (6.9%) | 0.2% (10.7%) | 0.4% (12.7%) | 14.2% (96.7%) |
+| latent oracle | 1.8% (17.6%) | 2.2% (22.9%) | 2.2% (26.4%) | 6.4% (51.1%) |
+| oracle - null, 95% paired bootstrap, points | +1.6 [+0.0, +3.3] | +2.0 [+0.7, +3.8] | +1.8 [+0.0, +4.0] | **-7.8 [-14.7, -1.1]** |
+| `runs/stage0-a`, no plan, confidence order | 0.0% | 2.0% | 9.8% | |
+| latent oracle, confidence order | 0.0% (3.8%) | 1.1% (23.6%) | 2.0% (50.7%) | |
+| kind match: oracle / null | 0.795 / 0.229 | 0.818 / 0.262 | 0.821 / 0.271 | 0.814 / 0.286 |
+| the reference's line count: oracle / null | 70.0% / 9.6% | 72.4% / 10.9% | 72.4% / 10.9% | 68.7% / 12.0% |
+| samples reproducing the reference | 0.0% | 0.0% | 0.0% | 0.0% |
+
+- **Step 0 equalled `runs/stage0-a`** exactly (2.7907 / 0.9332 / 0.44%).
+- **Gate: rho = 0.075 [0.018, 0.144], NOT READ** by the reading rule: no sample reproduces the reference at one
+  token per step (the rule needs half), so there is no problem on which the content arrived.
+- **Held-out loss with every token masked**, oracle / null / another function's plan, nats per token at step
+  5,000: 2.194 / 4.177 / 15.109 (structure oracle: 2.984 / 4.166 / 12.739). Plan gain (null - oracle) at k = 0, 2,
+  4, 6 of K = 8 (0, 8, 29 and 62% of the canvas revealed): +1.982, +1.373, +0.558, +0.116. Next-token loss with the
+  plan and the full left context: 0.702, accuracy 0.852 (step 0: 0.933, 0.797).
+- **Probe at K = 8** with the oracle plan: 0.4, 0.0, 0.4, 0.7, 0.9, 1.8% at steps 0 to 5,000; kind match 0.24 to
+  0.80; reproduced 0.0% throughout. Gates: mean |tanh(a_l)| 0.073, largest 0.25.
+
+Reading (Claude's, 23 Nov 2026):
+
+1. **By the rule: not read.** The latent plan did not deliver the content. Reproducing a ~70-token program exactly
+   at one token per step needs the reference token on top at about 99% of positions; with the plan it is 85%
+   (held-out corpus, full left context: 0.852^70 is about 1e-5). So step 2 does not show that content cannot help
+   at K = 8, and neither of the gate's conclusions is drawn ("the plan route is closed", "even the content does
+   not reach H2").
+2. **What both oracles show.** The realizer uses a plan heavily and trusts it: another function's plan costs 8.6
+   (structure) and 10.9 (latent) nats per token above the null plan. It takes the plan's form (kind match 0.8, the
+   reference's line count in about 70% of samples against 10 to 12% without) and fills it with its own content. At
+   one token per step that costs 6 to 8 points (-6.4 and -7.8, both intervals below zero); at K = 8 to 128 the gain
+   is at most +2 points; with a plan the confidence order collapses. The plan's information is used where little is
+   revealed (1.98 nats per token with everything masked, 0.12 with 62% revealed).
+3. **A train-test gap of the kind Sec. 5.1 names.** In training the plan always describes the program being
+   written; in sampling the realizer's own tokens soon depart from the plan's reference, and the plan's layout
+   (absolute start and length codes) then pulls it into the reference's form. Sec. 5.1 rejects conditioning on the
+   target encoder's view because it "opens a train-test gap of the same kind as exposure bias"; both oracles
+   condition on the reference and show that gap. A plan the method could use (predicted or sampled) disagrees with
+   the realizer's samples more, so a realizer meant to use one has to be trained on such plans, as the paper's
+   Stage 2 is, not on oracles. The gap also makes the oracles a weaker upper bound than intended.
+4. **Without distillation.** Every plan of steps 1 and 2 was tested on a realizer trained without the paper's
+   distillation (recorded above as a deviation). Sec. 5.1 combines the plan with distillation in Stage 2.
+
+**Next (the author's decision, open on 23 Nov 2026).** The options written before the run for NOT READ: a longer or
+faster-learning bridge run (a learning-rate multiplier for the new modules, not built), or a decision between
+distillation and more depth on step 1's result and the steps 3 and 4 argument. Claude's recommendation: stop the
+oracles. A plan that did carry the content would let the realizer nearly copy the program at K = 8, which says
+nothing about whether a planner can sample such content from the prompt; the measured gap says an imperfect content
+plan hurts unless the realizer is trained on imperfect plans. Distillation is the paper's own instrument for the
+parallel step and is untested here.
